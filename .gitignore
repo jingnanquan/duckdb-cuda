@@ -24,9 +24,12 @@
 *.sql
 .github/
 
+*enter/
 .codebuddy/
-a_idea/
+# a_idea/
 data/tpc*
+*venv/
+*results/
 
 #==============================================================================#
 # Explicit files to ignore (only matches one).
