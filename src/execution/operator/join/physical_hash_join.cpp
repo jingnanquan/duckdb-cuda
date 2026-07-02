@@ -1,8 +1,10 @@
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/radix_partitioning.hpp"
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/execution/operator/join/bitmap_hash_join_executor.hpp"
 #include "duckdb/execution/operator/aggregate/ungrouped_aggregate_state.hpp"
 #include "duckdb/function/aggregate/distributive_function_utils.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
@@ -139,15 +141,31 @@ public:
 	      temporary_memory_state(TemporaryMemoryManager::Get(context).Register(context)), finalized(false),
 	      active_local_states(0), total_size(0), max_partition_size(0), max_partition_count(0),
 	      probe_side_requirement(0), scanned_data(false) {
+		// Bitmap-Join (BHJ) hook (design §6.3 / module 6.4): mirror the operator-level flag onto the
+		// sink state and construct the BitmapJoinExecutor. We still construct the regular (empty) hash
+		// table so the global sink state stays valid (destructor logging, perfect-hash bookkeeping);
+		// the BHJ build/probe branches never touch it, so no Build/Finalize cost is paid.
+		// NOTE: BHJ is additionally gated by the user-facing config switch `open_bitmap_join`;
+		// when that switch is false the operator-level flag is ignored and the regular DuckDB
+		// hash-join path is used unchanged.
+		const bool open_bitmap_join = Settings::Get<OpenBitmapJoinSetting>(context_p);
+		use_bitmap_join = op.use_bitmap_join && open_bitmap_join;
+		if (use_bitmap_join) {
+			bitmap_join_executor = make_uniq<BitmapJoinExecutor>(op);
+		}
 		hash_table = op.InitializeHashTable(context);
 
-		// For perfect hash join
-		perfect_join_executor = make_uniq<PerfectHashJoinExecutor>(op, *hash_table);
+		// For perfect hash join (gated by the user-facing `open_perfect_join` switch).
+		const bool open_perfect_join = Settings::Get<OpenPerfectJoinSetting>(context_p);
 		bool use_perfect_hash = false;
-		if (op.conditions.size() == 1 && !op.join_stats.empty() && op.join_stats[1] &&
-		    TypeIsIntegral(op.join_stats[1]->GetType().InternalType()) && NumericStats::HasMinMax(*op.join_stats[1])) {
-			use_perfect_hash = perfect_join_executor->CanDoPerfectHashJoin(op, NumericStats::Min(*op.join_stats[1]),
-			                                                               NumericStats::Max(*op.join_stats[1]));
+		if (open_perfect_join) {
+			perfect_join_executor = make_uniq<PerfectHashJoinExecutor>(op, *hash_table);
+			if (op.conditions.size() == 1 && !op.join_stats.empty() && op.join_stats[1] &&
+			    TypeIsIntegral(op.join_stats[1]->GetType().InternalType()) &&
+			    NumericStats::HasMinMax(*op.join_stats[1])) {
+				use_perfect_hash = perfect_join_executor->CanDoPerfectHashJoin(
+				    op, NumericStats::Min(*op.join_stats[1]), NumericStats::Max(*op.join_stats[1]));
+			}
 		}
 		// For external hash join
 		external = ClientConfig::GetConfig(context).force_external;
@@ -208,6 +226,12 @@ public:
 
 	bool skip_filter_pushdown = false;
 	unique_ptr<JoinFilterGlobalState> global_filter_state;
+
+	//! Bitmap-Join (BHJ) hook (design §6.3). When true, the BHJ execution path is selected.
+	bool use_bitmap_join = false;
+	//! BHJ executor (module 6.4): owns the global bitmap + materialized RHS payload columns.
+	//! Only set when use_bitmap_join is true.
+	unique_ptr<BitmapJoinExecutor> bitmap_join_executor;
 };
 
 unique_ptr<JoinFilterLocalState> JoinFilterPushdownInfo::GetLocalState(JoinFilterGlobalState &gstate) const {
@@ -226,6 +250,14 @@ public:
 			join_key_executor.AddExpression(*cond.right);
 		}
 		join_keys.Initialize(allocator, op.condition_types);
+
+		if (gstate.use_bitmap_join) {
+			// BHJ build (module 6.4): allocate the thread-local bitmap; no hash table / payload chunk.
+			// join_key_executor (over cond.right) yields the build-side rowid key for SinkBitmap.
+			bitmap_local.Initialize(gstate.bitmap_join_executor->BitmapSize());  //这里是全局的bitmap
+			gstate.active_local_states++;
+			return;
+		}
 
 		if (!op.payload_columns.col_types.empty()) {
 			payload_chunk.Initialize(allocator, op.payload_columns.col_types);
@@ -253,6 +285,9 @@ public:
 	unique_ptr<JoinHashTable> hash_table;
 
 	unique_ptr<JoinFilterLocalState> local_filter_state;
+
+	//! Bitmap-Join (BHJ, module 6.4): thread-local bitmap, OR-merged in Combine.
+	BitmapJoinLocalState bitmap_local;
 };
 
 unique_ptr<JoinHashTable> PhysicalHashJoin::InitializeHashTable(ClientContext &context) const {
@@ -328,7 +363,17 @@ void JoinFilterPushdownInfo::Sink(DataChunk &chunk, JoinFilterLocalState &lstate
 
 SinkResultType PhysicalHashJoin::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<HashJoinGlobalSinkState>();
-	auto &lstate = input.local_state.Cast<HashJoinLocalSinkState>();
+	auto &lstate = input.local_state.Cast<HashJoinLocalSinkState>();  //总之我包含了bitmap_local
+
+	if (gstate.use_bitmap_join) {
+		// BHJ build path (module 6.4): evaluate the build-side join key (= PK column value) and
+		// record its rowid into the thread-local bitmap + scatter the RHS payload columns.
+		// todo: 新增rowid_join_key_executor，用于获取rowid作为joinkey
+		lstate.join_keys.Reset();
+		lstate.join_key_executor.Execute(chunk, lstate.join_keys);
+		gstate.bitmap_join_executor->SinkBitmap(context, chunk, lstate.join_keys, lstate.bitmap_local);
+		return SinkResultType::NEED_MORE_INPUT;
+	}
 
 	// resolve the join keys for the right chunk
 	lstate.join_keys.Reset();
@@ -357,6 +402,17 @@ void JoinFilterPushdownInfo::Combine(JoinFilterGlobalState &gstate, JoinFilterLo
 SinkCombineResultType PhysicalHashJoin::Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const {
 	auto &gstate = input.global_state.Cast<HashJoinGlobalSinkState>();
 	auto &lstate = input.local_state.Cast<HashJoinLocalSinkState>();
+
+	if (gstate.use_bitmap_join) {
+		// BHJ combine path (module 6.4): OR-merge the thread-local bitmap into the global bitmap.
+		// Payload columns were already scattered into the global vectors during Sink (no merge needed).
+		gstate.bitmap_join_executor->CombineBitmap(lstate.bitmap_local);
+
+		auto &client_profiler = QueryProfiler::Get(context.client);
+		context.thread.profiler.Flush(*this);
+		client_profiler.Flush(context.thread.profiler);
+		return SinkCombineResultType::FINISHED;
+	}
 
 	lstate.hash_table->GetSinkCollection().FlushAppendState(lstate.append_state);
 	auto guard = gstate.Lock();
@@ -446,6 +502,10 @@ static idx_t GetPartitioningSpaceRequirement(ClientContext &context, const vecto
 
 void PhysicalHashJoin::PrepareFinalize(ClientContext &context, GlobalSinkState &global_state) const {
 	auto &gstate = global_state.Cast<HashJoinGlobalSinkState>();
+	if (gstate.use_bitmap_join) {
+		// BHJ has no partitioning/sizing to prepare (module 6.4); nothing to do here.
+		return;
+	}
 	const auto &ht = *gstate.hash_table;
 
 	gstate.total_size =
@@ -889,6 +949,13 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::Finalize(ClientContext &context, o
 SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                             OperatorSinkFinalizeInput &input) const {
 	auto &sink = input.global_state.Cast<HashJoinGlobalSinkState>();
+	if (sink.use_bitmap_join) {
+		// BHJ finalize (module 6.4): no partitioning / pointer table; just mark ready and unblock the
+		// probe pipeline (the build->probe dependency from BuildPipelines is preserved).
+		sink.bitmap_join_executor->FinalizeBitmap();
+		sink.finalized = true;
+		return SinkFinalizeType::READY;
+	}
 	auto &ht = *sink.hash_table;
 
 	sink.temporary_memory_state->UpdateReservation(context);
@@ -970,11 +1037,16 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	}
 
 	// check for possible perfect hash table
-	auto use_perfect_hash = sink.perfect_join_executor->CanDoPerfectHashJoin(*this, min, max);
-	if (use_perfect_hash) {
-		D_ASSERT(ht.equality_types.size() == 1);
-		auto key_type = ht.equality_types[0];
-		use_perfect_hash = sink.perfect_join_executor->BuildPerfectHashTable(key_type);
+	// (gated by the `open_perfect_join` switch: when off, perfect_join_executor is nullptr and
+	// we skip the perfect-hash path entirely).
+	bool use_perfect_hash = false;
+	if (sink.perfect_join_executor) {
+		use_perfect_hash = sink.perfect_join_executor->CanDoPerfectHashJoin(*this, min, max);
+		if (use_perfect_hash) {
+			D_ASSERT(ht.equality_types.size() == 1);
+			auto key_type = ht.equality_types[0];
+			use_perfect_hash = sink.perfect_join_executor->BuildPerfectHashTable(key_type);
+		}
 	}
 
 	if (filter_min_max) {
@@ -1024,6 +1096,11 @@ public:
 unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &context) const {
 	auto &allocator = BufferAllocator::Get(context.client);
 	auto &sink = sink_state->Cast<HashJoinGlobalSinkState>();
+	if (sink.use_bitmap_join) {
+		// BHJ probe-side operator state (module 6.4).
+		// 对于bitmap join，我不需要HashJoinOperatorState，localstate和globalstate已经够用了
+		return sink.bitmap_join_executor->GetOperatorState(context);
+	}
 	auto state = make_uniq<HashJoinOperatorState>(context.client, sink);
 	state->lhs_join_keys.Initialize(allocator, condition_types);
 	if (!lhs_output_columns.col_types.empty()) {
@@ -1047,8 +1124,12 @@ unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &c
 
 OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
                                                      GlobalOperatorState &gstate, OperatorState &state_p) const {
-	auto &state = state_p.Cast<HashJoinOperatorState>();
 	auto &sink = sink_state->Cast<HashJoinGlobalSinkState>();
+	if (sink.use_bitmap_join) {
+		// BHJ probe path (module 6.4): single bit test per row, then dictionary-reference the payload.
+		return sink.bitmap_join_executor->ProbeBitmap(context, input, chunk, state_p);
+	}
+	auto &state = state_p.Cast<HashJoinOperatorState>();
 	D_ASSERT(sink.finalized);
 	D_ASSERT(!sink.scanned_data);
 
@@ -1596,6 +1677,10 @@ InsertionOrderPreservingMap<string> PhysicalHashJoin::ParamsToString() const {
 		                       ExpressionTypeToOperator(join_condition.comparison), join_condition.right->GetName());
 	}
 	result["Conditions"] = condition_info;
+
+	if (use_bitmap_join) {
+		result["Bitmap Join"] = "yes";
+	}
 
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;

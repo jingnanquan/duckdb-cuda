@@ -56,6 +56,9 @@
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/main/settings.hpp"
 #include "parquet_multi_file_info.hpp"
+#include "duckdb/catalog/catalog_entry/bitmap_join_meta.hpp"
+
+#include <cstdlib>
 
 namespace duckdb {
 
@@ -841,6 +844,113 @@ static vector<unique_ptr<Expression>> ParquetWriteSelect(CopyToSelectInput &inpu
 	return {};
 }
 
+//===--------------------------------------------------------------------===//
+// Bitmap-Join metadata (design doc §6.2, module M-C)
+//===--------------------------------------------------------------------===//
+struct PragmaBitmapJoinMetaData : public GlobalTableFunctionState {
+	PragmaBitmapJoinMetaData() : offset(0) {
+	}
+	vector<vector<Value>> rows;
+	idx_t offset;
+};
+
+static void BitmapJoinMetaSchema(vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"kind",     "table_name", "column_name",  "rowid_or_ref_column",
+	         "pk_table", "pk_column",  "rowid_offset", "row_count"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT};
+}
+
+static unique_ptr<FunctionData> PragmaBitmapJoinMetaBind(ClientContext &context, TableFunctionBindInput &input,
+                                                         vector<LogicalType> &return_types, vector<string> &names) {
+	BitmapJoinMetaSchema(return_types, names);
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> PragmaBitmapJoinMetaInit(ClientContext &context,
+                                                                     TableFunctionInitInput &input) {
+	auto result = make_uniq<PragmaBitmapJoinMetaData>();
+	auto &registry = BitmapJoinMetaRegistry::Get(context);
+	for (auto &pk : registry.GetPKBindings()) {
+		vector<Value> row;
+		row.push_back(Value("pk"));
+		row.push_back(Value(pk.pk_table));
+		row.push_back(Value(pk.pk_column));
+		row.push_back(Value(pk.rowid_column));
+		row.push_back(Value(LogicalType::VARCHAR)); // pk_table (n/a for PK rows)
+		row.push_back(Value(LogicalType::VARCHAR)); // pk_column (n/a for PK rows)
+		row.push_back(Value::BIGINT(pk.rowid_offset));
+		row.push_back(Value::BIGINT(static_cast<int64_t>(pk.row_count)));
+		result->rows.push_back(std::move(row));
+	}
+	for (auto &fk : registry.GetFKBindings()) {
+		vector<Value> row;
+		row.push_back(Value("fk"));
+		row.push_back(Value(fk.fk_table));
+		row.push_back(Value(fk.fk_column));
+		row.push_back(Value(fk.ref_column));
+		row.push_back(Value(fk.pk_table));
+		row.push_back(Value(fk.pk_column));
+		row.push_back(Value(LogicalType::BIGINT)); // rowid_offset (n/a for FK rows)
+		row.push_back(Value(LogicalType::BIGINT)); // row_count (n/a for FK rows)
+		result->rows.push_back(std::move(row));
+	}
+	return std::move(result);
+}
+
+static void PragmaBitmapJoinMetaFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.global_state->Cast<PragmaBitmapJoinMetaData>();
+	idx_t count = 0;
+	while (data.offset < data.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = data.rows[data.offset];
+		for (idx_t col = 0; col < row.size(); col++) {
+			output.SetValue(col, count, row[col]);
+		}
+		data.offset++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//! PRAGMA bitmap_join_meta; -> SELECT * FROM pragma_bitmap_join_meta()
+static string PragmaBitmapJoinMetaQuery(ClientContext &context, const FunctionParameters &parameters) {
+	return "SELECT * FROM pragma_bitmap_join_meta()";
+}
+
+//! PRAGMA bitmap_join_load('/path/to/bitmap_join_meta.json');
+static void PragmaBitmapJoinLoad(ClientContext &context, const FunctionParameters &parameters) {
+	auto path = parameters.values[0].ToString();
+	BitmapJoinMetaRegistry::Get(context).LoadFromJson(path);
+}
+
+//! PRAGMA bitmap_join_force(true|false); -- global switch enabling the BHJ hook (design §6.3)
+static void PragmaBitmapJoinForce(ClientContext &context, const FunctionParameters &parameters) {
+	auto enabled = parameters.values[0].GetValue<bool>();
+	BitmapJoinMetaRegistry::Get(context).SetForceBitmapJoin(enabled);
+}
+
+static void RegisterBitmapJoinMeta(ExtensionLoader &loader) {
+	TableFunction bitmap_meta_fun("pragma_bitmap_join_meta", {}, PragmaBitmapJoinMetaFunction, PragmaBitmapJoinMetaBind,
+	                              PragmaBitmapJoinMetaInit);
+	loader.RegisterFunction(bitmap_meta_fun);
+	loader.RegisterFunction(PragmaFunction::PragmaStatement("bitmap_join_meta", PragmaBitmapJoinMetaQuery));
+	loader.RegisterFunction(PragmaFunction::PragmaCall("bitmap_join_load", PragmaBitmapJoinLoad, {LogicalType::VARCHAR}));
+	loader.RegisterFunction(
+	    PragmaFunction::PragmaCall("bitmap_join_force", PragmaBitmapJoinForce, {LogicalType::BOOLEAN}));
+
+	// Startup auto-load: if DUCKDB_BITMAP_JOIN_META points at an existing file, load it (best-effort).
+	const char *meta_env = std::getenv("DUCKDB_BITMAP_JOIN_META");
+	if (meta_env && meta_env[0] != '\0') {
+		std::ifstream probe(meta_env, std::ios::binary);
+		if (probe.good()) {
+			try {
+				BitmapJoinMetaRegistry::GetInstance().LoadFromJson(meta_env);
+			} catch (...) { // NOLINT: best-effort, never fail extension load
+			}
+		}
+	}
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &db_instance = loader.GetDatabaseInstance();
 	auto &fs = db_instance.GetFileSystem();
@@ -908,6 +1018,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto parquet_key_fun = PragmaFunction::PragmaCall("add_parquet_key", ParquetCrypto::AddKey,
 	                                                  {LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(parquet_key_fun);
+
+	// bitmap_join metadata registry: diagnostic PRAGMA + loaders (design §6.2)
+	RegisterBitmapJoinMeta(loader);
 
 	auto &config = DBConfig::GetConfig(db_instance);
 	config.replacement_scans.emplace_back(ParquetScanReplacement);

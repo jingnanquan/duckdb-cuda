@@ -1210,6 +1210,28 @@ struct OldImplicitCastingSetting {
 	static constexpr idx_t SettingIndex = 70;
 };
 
+struct OpenBitmapJoinSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "open_bitmap_join";
+	static constexpr const char *Description =
+	    "If true, allow PhysicalHashJoin to use the Bitmap-Join (BHJ) execution path when applicable";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "false";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
+	static constexpr idx_t SettingIndex = 95;
+};
+
+struct OpenPerfectJoinSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "open_perfect_join";
+	static constexpr const char *Description =
+	    "If true, allow PhysicalHashJoin to use the Perfect-Hash-Join execution path when applicable";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
+	static constexpr idx_t SettingIndex = 96;
+};
+
 struct OrderByNonIntegerLiteralSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "order_by_non_integer_literal";
@@ -1594,7 +1616,7 @@ struct ZstdMinStringLengthSetting {
 };
 
 struct GeneratedSettingInfo {
-	static constexpr idx_t MaxSettingIndex = 95;
+	static constexpr idx_t MaxSettingIndex = 97;
 };
 
 //===----------------------------------------------------------------------===//

@@ -145,6 +145,11 @@ def _quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _quote_sql_string(value: str) -> str:
+    """把字符串安全包成 SQL 字面量（单引号，处理内嵌单引号）"""
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _parquet_path(dir_: Path, table: str) -> Path:
     return dir_ / f"{table}.parquet"
 
@@ -388,13 +393,14 @@ class BitmapPreprocessor:
             return
         tmp_path = parquet_path.with_suffix(".parquet.tmp")
         qcol = _quote_ident(ROWID_COLUMN_NAME)
+        qtmp = _quote_sql_string(str(tmp_path))
         sql = (
             f"COPY (SELECT *, "
             f"   CAST(row_number() OVER () - 1 AS UBIGINT) AS {qcol} "
-            f"FROM read_parquet(?)) TO ? (FORMAT PARQUET)"
+            f"FROM read_parquet(?)) TO {qtmp} (FORMAT PARQUET)"
         )
         t0 = time.time()
-        self.con.execute(sql, [str(parquet_path), str(tmp_path)])
+        self.con.execute(sql, [str(parquet_path)])
         os.replace(tmp_path, parquet_path)
         logger.info(
             "[%s] appended %s to %s (took %.2fs)",
@@ -470,6 +476,7 @@ class BitmapPreprocessor:
         tmp_path = fk_path.with_suffix(".parquet.tmp")
         qfk = _quote_ident(fk_col)
         qref = _quote_ident(ref_col)
+        qtmp = _quote_sql_string(str(tmp_path))
         t0 = time.time()
 
         if pk_binding.rowid_column == pk_binding.pk_column:
@@ -483,9 +490,9 @@ class BitmapPreprocessor:
             )
             sql = (
                 f"COPY (SELECT *, {expr} FROM read_parquet(?)) "
-                f"TO ? (FORMAT PARQUET)"
+                f"TO {qtmp} (FORMAT PARQUET)"
             )
-            self.con.execute(sql, [str(fk_path), str(tmp_path)])
+            self.con.execute(sql, [str(fk_path)])
         else:
             # 非稠密：LEFT JOIN PK 表
             pk_path = self._output_parquet(pk_binding.pk_table)
@@ -498,10 +505,10 @@ class BitmapPreprocessor:
                 f"  FROM read_parquet(?) AS f "
                 f"  LEFT JOIN read_parquet(?) AS p "
                 f"    ON f.{qfk} = p.{qpk_col}"
-                f") TO ? (FORMAT PARQUET)"
+                f") TO {qtmp} (FORMAT PARQUET)"
             )
             self.con.execute(
-                sql, [str(fk_path), str(pk_path), str(tmp_path)]
+                sql, [str(fk_path), str(pk_path)]
             )
 
         os.replace(tmp_path, fk_path)

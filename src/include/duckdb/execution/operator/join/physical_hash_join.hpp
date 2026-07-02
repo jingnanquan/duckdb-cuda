@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/common/value_operations/value_operations.hpp"
+#include "duckdb/catalog/catalog_entry/bitmap_join_meta.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
@@ -53,6 +54,22 @@ public:
 
 	//! Join Keys statistics (optional)
 	vector<unique_ptr<BaseStatistics>> join_stats;
+
+	//===------------------------------------------------------------------===//
+	// Bitmap-Join (BHJ) hook (design doc §6.3, module M-O)
+	//===------------------------------------------------------------------===//
+	//! Whether this join should use the bitmap-join path. Set at plan time (see
+	//! PlanComparisonJoin) only when the global force switch is enabled and the join resolves
+	//! against BitmapJoinMetaRegistry. Default false => the existing execution path is unchanged.
+	//! NOTE: the BitmapJoinExecutor itself is module 6.4; when this flag is true the execution
+	//! path currently raises NotImplementedException.
+	bool use_bitmap_join = false;
+	//! Resolved PK/FK binding for this join (valid only when use_bitmap_join is true).
+	BitmapJoinResolved bitmap_join_resolved {};
+	//! Index of the build-side rowid column within the build chunk.
+	idx_t bitmap_build_rowid_idx = DConstants::INVALID_INDEX;
+	//! Index of the probe-side *_ref column within the probe chunk.
+	idx_t bitmap_probe_ref_idx = DConstants::INVALID_INDEX;
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;

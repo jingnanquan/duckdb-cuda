@@ -9,6 +9,7 @@ endif()
 add_library_unity(
   duckdb_catalog
   OBJECT
+  bitmap_join_meta.cpp
   catalog_entry.cpp
   catalog_entry_retriever.cpp
   catalog.cpp

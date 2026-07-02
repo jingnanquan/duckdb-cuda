@@ -9,6 +9,7 @@ add_library_unity(
   physical_delim_join.cpp
   physical_left_delim_join.cpp
   physical_hash_join.cpp
+  bitmap_hash_join_executor.cpp
   physical_iejoin.cpp
   physical_join.cpp
   physical_nested_loop_join.cpp

@@ -11,6 +11,7 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/catalog/catalog_entry/bitmap_join_meta.hpp"
 
 namespace duckdb {
 
@@ -54,11 +55,35 @@ PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoi
 	bool prefer_range_joins = Settings::Get<PreferRangeJoinsSetting>(context);
 	prefer_range_joins = prefer_range_joins && can_iejoin;
 	if (has_equality && !prefer_range_joins) {
+		// Detect Bitmap-Join (BHJ) eligibility BEFORE op.conditions is moved into the operator
+		// (design §6.3): single equality condition on an INNER / RIGHT_SEMI join.
+		// 只有一个比较符号
+		bool bhj_eligible = op.conditions.size() == 1 &&
+		                    op.conditions[0].comparison == ExpressionType::COMPARE_EQUAL &&
+		                    (op.join_type == JoinType::INNER || op.join_type == JoinType::RIGHT_SEMI);
+
 		// Equality join with small number of keys : possible perfect join optimization
 		auto &join = Make<PhysicalHashJoin>(op, left, right, std::move(op.conditions), op.join_type,
 		                                    op.left_projection_map, op.right_projection_map, std::move(op.mark_types),
 		                                    op.estimated_cardinality, std::move(op.filter_pushdown));
-		join.Cast<PhysicalHashJoin>().join_stats = std::move(op.join_stats);
+		auto &hash_join = join.Cast<PhysicalHashJoin>();
+		hash_join.join_stats = std::move(op.join_stats);
+
+		// Bitmap-Join hook: plan-time enablement, gated by the global force switch so that the
+		// default execution path is never affected (default switch = false).
+		if (bhj_eligible && BitmapJoinMetaRegistry::Get(context).IsForceBitmapJoin()) {
+			// Resolve the PK binding. Module 6.6 (BitmapJoinRule) is the proper resolver that
+			// reverse-maps column bindings to catalog table/column names; until it lands we use
+			// the test-only override registered via BitmapJoinMetaRegistry::SetForceResolvedPK.
+			auto &registry = BitmapJoinMetaRegistry::Get(context);
+			auto pk = registry.GetForceResolvedPK();
+			if (pk != nullptr) {
+				hash_join.use_bitmap_join = true;
+				hash_join.bitmap_join_resolved.pk = pk;
+				hash_join.bitmap_join_resolved.fk = nullptr; // not needed for BHJ build/probe
+				hash_join.bitmap_join_resolved.build_is_pk_side = true;
+			}
+		}
 		return join;
 	}
 
