@@ -47,7 +47,8 @@ enum class OptimizerType : uint32_t {
 	TOP_N_WINDOW_ELIMINATION = 30,
 	COMMON_SUBPLAN = 31,
 	JOIN_ELIMINATION = 32,
-	WINDOW_SELF_JOIN = 33
+	WINDOW_SELF_JOIN = 33,
+	BITMAP_JOIN_RESOLVE = 34
 };
 
 string OptimizerTypeToString(OptimizerType type);

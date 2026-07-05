@@ -38,7 +38,8 @@ set(TEST_API_OBJECTS
     test_windows_unicode_path.cpp
     test_object_cache.cpp
     test_buffer_pool_eviction.cpp
-    test_bitmap_join_perf.cpp)
+    test_bitmap_join_perf.cpp
+    test_bitmap_join_auto_resolve.cpp)
 
 if(NOT WIN32)
   set(TEST_API_OBJECTS ${TEST_API_OBJECTS} test_read_only.cpp)

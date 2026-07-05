@@ -14,6 +14,7 @@
 #include "duckdb/planner/joinside.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
+#include "duckdb/catalog/catalog_entry/bitmap_join_meta.hpp"
 
 namespace duckdb {
 
@@ -40,6 +41,15 @@ public:
 	unique_ptr<JoinFilterPushdownInfo> filter_pushdown;
 	//! Filtering predicate from the ON clause with expressions that don't reference both sides
 	unique_ptr<Expression> predicate;
+	//! Bitmap-Join (BHJ) auto-resolution hint (design doc b_idea/6.4, module 6.6 M-R prototype).
+	//! Filled in by BitmapJoinResolver (the last built-in optimizer pass, running right before
+	//! ColumnBindingResolver flattens column bindings) whenever this join's single equality
+	//! condition matches a PK/FK binding registered in BitmapJoinMetaRegistry AND the PK
+	//! (dimension) table is confirmed to land on the build side. PlanComparisonJoin reads this
+	//! to wire up PhysicalHashJoin::use_bitmap_join without relying on the test-only
+	//! SetForceResolvedPK override. Left null (the common case / open_bitmap_join=false) this
+	//! has zero effect on planning.
+	unique_ptr<BitmapJoinResolved> bhj_hint;
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;

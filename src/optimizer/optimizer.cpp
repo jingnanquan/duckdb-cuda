@@ -5,6 +5,8 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/query_profiler.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/optimizer/bitmap_join_resolver.hpp"
 #include "duckdb/optimizer/build_probe_side_optimizer.hpp"
 #include "duckdb/optimizer/column_lifetime_analyzer.hpp"
 #include "duckdb/optimizer/common_aggregate_optimizer.hpp"
@@ -320,6 +322,18 @@ void Optimizer::RunBuiltInOptimizers() {
 	RunOptimizer(OptimizerType::JOIN_FILTER_PUSHDOWN, [&]() {
 		JoinFilterPushdownOptimizer join_filter_pushdown(*this);
 		join_filter_pushdown.VisitOperator(*plan);
+	});
+
+	// Bitmap-Join (BHJ) auto-resolution (design doc b_idea/6.4, 条目1/2). Must run last: after
+	// JoinOrderOptimizer/ColumnLifetimeAnalyzer/RemoveUnusedColumns have settled the join
+	// shape/projections, and before ColumnBindingResolver flattens column bindings (which
+	// happens at the very start of PhysicalPlanGenerator::CreatePlan, i.e. after Optimize()
+	// returns). Gated on the open_bitmap_join setting so the default path has zero overhead.
+	RunOptimizer(OptimizerType::BITMAP_JOIN_RESOLVE, [&]() {
+		if (Settings::Get<OpenBitmapJoinSetting>(context)) {
+			BitmapJoinResolver resolver(context);
+			resolver.VisitOperator(*plan);
+		}
 	});
 }
 

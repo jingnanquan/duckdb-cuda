@@ -1,3 +1,12 @@
 CompileFlags:
   CompilationDatabase: .cache/clangd
-  Add: -Wno-unqualified-std-cast-call
+  Add:
+    - -Wno-unqualified-std-cast-call
+    - -Wno-c++11-extensions
+
+Diagnostics:
+  UnusedIncludes: None
+
+Index:
+  Background: Build
+  StandardLibrary: Yes

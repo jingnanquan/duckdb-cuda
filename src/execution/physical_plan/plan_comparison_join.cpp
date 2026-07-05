@@ -69,20 +69,33 @@ PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoi
 		auto &hash_join = join.Cast<PhysicalHashJoin>();
 		hash_join.join_stats = std::move(op.join_stats);
 
-		// Bitmap-Join hook: plan-time enablement, gated by the global force switch so that the
-		// default execution path is never affected (default switch = false).
-		if (bhj_eligible && BitmapJoinMetaRegistry::Get(context).IsForceBitmapJoin()) {
-			// Resolve the PK binding. Module 6.6 (BitmapJoinRule) is the proper resolver that
-			// reverse-maps column bindings to catalog table/column names; until it lands we use
-			// the test-only override registered via BitmapJoinMetaRegistry::SetForceResolvedPK.
-			auto &registry = BitmapJoinMetaRegistry::Get(context);
-			auto pk = registry.GetForceResolvedPK();
-			if (pk != nullptr) {
-				hash_join.use_bitmap_join = true;
-				hash_join.bitmap_join_resolved.pk = pk;
-				hash_join.bitmap_join_resolved.fk = nullptr; // not needed for BHJ build/probe
-				hash_join.bitmap_join_resolved.build_is_pk_side = true;
+		// Bitmap-Join hook: plan-time enablement. Two paths feed into the same PK binding:
+		//   1. Test-only force override (BitmapJoinMetaRegistry::SetForceResolvedPK), kept as a
+		//      short-circuit so white-box tests can exercise BHJ without depending on the
+		//      BitmapJoinResolver optimizer pass.
+		//   2. Automatic path (design doc 条目1/2): BitmapJoinResolver already reverse-mapped
+		//      the join condition to catalog table/column names and, if the PK (dimension)
+		//      table was confirmed to be on the build side, stashed the result on
+		//      `op.bhj_hint`. When absent (open_bitmap_join=false, no registry match, or the FK
+		//      table landed on the build side) we simply fall back to a regular hash join.
+		auto &registry = BitmapJoinMetaRegistry::Get(context);
+		optional_ptr<const BitmapJoinPKBinding> pk;
+		if (bhj_eligible && registry.IsForceBitmapJoin() && registry.GetForceResolvedPK()) {
+			pk = registry.GetForceResolvedPK();
+		} else if (bhj_eligible && op.bhj_hint) {
+			// Defensive double-check (条目2): even if some future code path bypassed
+			// BitmapJoinResolver and set bhj_hint directly, never wire up a reversed binding -
+			// BitmapJoinExecutor only supports build_is_pk_side == true.
+			D_ASSERT(op.bhj_hint->build_is_pk_side);
+			if (op.bhj_hint->build_is_pk_side) {
+				pk = op.bhj_hint->pk;
 			}
+		}
+		if (pk) {
+			hash_join.use_bitmap_join = true;
+			hash_join.bitmap_join_resolved.pk = pk.get();
+			hash_join.bitmap_join_resolved.fk = nullptr; // not needed for BHJ build/probe
+			hash_join.bitmap_join_resolved.build_is_pk_side = true;
 		}
 		return join;
 	}

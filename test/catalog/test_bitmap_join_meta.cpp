@@ -138,19 +138,31 @@ TEST_CASE("PhysicalHashJoin bitmap-join hook (scaffolding)", "[bitmap_join]") {
 		REQUIRE(!StringUtil::Contains(plan, "Bitmap Join"));
 	}
 
-	// Switch on: plan-time hook flags the join (EXPLAIN marker), execution raises NotImplemented.
+	// Switch on the force override: this requires the PK binding to actually be registered
+	// (GetForceResolvedPK() looks it up by table/column), so register it first. The plan-time
+	// hook flags the join (EXPLAIN marker) and BHJ now executes for real - the executor is no
+	// longer a stub - producing the same results as the regular hash-join path.
+	BitmapJoinPKBinding dim_pk;
+	dim_pk.pk_table = "bhj_dim";
+	dim_pk.pk_column = "k";
+	dim_pk.rowid_column = "k";
+	dim_pk.rowid_offset = 0;
+	dim_pk.row_count = 2;
+	reg.RegisterPK(dim_pk);
+	reg.SetForceResolvedPK("bhj_dim", "k");
 	reg.SetForceBitmapJoin(true);
 	{
 		auto plan = ExplainText(con, join_query);
 		REQUIRE(StringUtil::Contains(plan, "Bitmap Join"));
 
 		auto result = con.Query(join_query);
-		REQUIRE(result->HasError());
-		REQUIRE(StringUtil::Contains(StringUtil::Lower(result->GetError()), "not implemented"));
+		REQUIRE(!result->HasError());
+		REQUIRE(CHECK_COLUMN(result, 0, {3}));
 	}
 
 	// Switch off again: behaviour returns to normal.
 	reg.SetForceBitmapJoin(false);
+	reg.SetForceResolvedPK("", "");
 	{
 		auto result = con.Query(join_query);
 		REQUIRE(!result->HasError());
