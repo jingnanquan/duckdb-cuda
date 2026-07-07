@@ -26,6 +26,13 @@ void ColumnBindingResolver::VisitOperator(LogicalOperator &op) {
 		for (auto &cond : comp_join.conditions) {
 			VisitExpression(&cond.left);
 		}
+		// Bitmap-Join (BHJ) hidden probe-side `*_ref` column (design doc b_idea/6.4, 条目3):
+		// resolved against the same (LHS) bindings as cond.left, since BitmapJoinResolver
+		// stashed it as a plain BoundColumnRefExpression rooted at children[0]. No-op (null) in
+		// the common case where BHJ is not engaged or the fast rowid path applies.
+		if (comp_join.bhj_probe_ref_ref) {
+			VisitExpression(&comp_join.bhj_probe_ref_ref);
+		}
 		// visit the duplicate eliminated columns on the LHS, if any
 		for (auto &expr : comp_join.duplicate_eliminated_columns) {
 			VisitExpression(&expr);
@@ -34,6 +41,11 @@ void ColumnBindingResolver::VisitOperator(LogicalOperator &op) {
 		VisitOperator(*comp_join.children[1]);
 		for (auto &cond : comp_join.conditions) {
 			VisitExpression(&cond.right);
+		}
+		// Bitmap-Join (BHJ) hidden build-side `_rowid` column (条目3): resolved against the RHS
+		// bindings, mirroring bhj_probe_ref_ref above.
+		if (comp_join.bhj_build_rowid_ref) {
+			VisitExpression(&comp_join.bhj_build_rowid_ref);
 		}
 		// finally update the bindings with the result bindings of the join
 		bindings = op.GetColumnBindings();

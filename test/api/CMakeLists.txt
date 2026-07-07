@@ -39,7 +39,10 @@ set(TEST_API_OBJECTS
     test_object_cache.cpp
     test_buffer_pool_eviction.cpp
     test_bitmap_join_perf.cpp
-    test_bitmap_join_auto_resolve.cpp)
+    test_bitmap_join_auto_resolve.cpp
+    test_bitmap_join_rowid_ref.cpp
+    test_bitmap_join_chain.cpp
+    test_bitmap_join_tpch.cpp)
 
 if(NOT WIN32)
   set(TEST_API_OBJECTS ${TEST_API_OBJECTS} test_read_only.cpp)

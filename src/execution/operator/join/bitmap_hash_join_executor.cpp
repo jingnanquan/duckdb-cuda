@@ -251,9 +251,15 @@ void BitmapJoinExecutor::SinkBitmap(ExecutionContext &context, DataChunk &chunk,
 	SelectionVector valid_rows(count);
 	vector<idx_t> rowids(count);
 	idx_t valid_count = 0;
-	// 这里使用joinkeys作为rowid直接填入bitmap中
-	ExtractBuildRowidsSwitch(build_keys.data[0], count, build_rowid_offset, bitmap_size, lstate.bitmap, valid_rows,
-	                         rowids.data(), valid_count);
+	// 条目3: when a materialized `_rowid` column was injected into the build chunk (PK column
+	// is not itself a dense rowid), read it directly instead of reusing the join key value.
+	Vector &rowid_vec = (join.bitmap_build_rowid_idx != DConstants::INVALID_INDEX)
+	                         ? chunk.data[join.bitmap_build_rowid_idx]
+	                         : build_keys.data[0];
+	const int64_t rowid_offset =
+	    (join.bitmap_build_rowid_idx != DConstants::INVALID_INDEX) ? 0 : build_rowid_offset;
+	ExtractBuildRowidsSwitch(rowid_vec, count, rowid_offset, bitmap_size, lstate.bitmap, valid_rows, rowids.data(),
+	                         valid_count);
 
 	if (valid_count == 0 || payload_columns.empty()) {
 		return;
@@ -387,14 +393,27 @@ OperatorResultType BitmapJoinExecutor::ProbeBitmap(ExecutionContext &context, Da
 	// LHS output columns (zero-copy reference into the probe chunk).
 	state.lhs_output.ReferenceColumns(input, join.lhs_output_columns.col_idxs);
 
-	// Resolve the probe-side join key (= rowid + offset) and test the bitmap.
-	state.join_keys.Reset();
-	state.probe_executor.Execute(input, state.join_keys);
-	const idx_t count = state.join_keys.size();
+	// 条目3: when a materialized `*_ref` column was injected into the probe chunk, read it
+	// directly and skip evaluating the join-key expression entirely.
+	idx_t count;
+	Vector *ref_vec;
+	int64_t ref_offset;
+	if (join.bitmap_probe_ref_idx != DConstants::INVALID_INDEX) {
+		count = input.size();
+		ref_vec = &input.data[join.bitmap_probe_ref_idx];
+		ref_offset = 0;
+	} else {
+		// Fast path: resolve the probe-side join key (= rowid + offset) and test the bitmap.
+		state.join_keys.Reset();
+		state.probe_executor.Execute(input, state.join_keys);
+		count = state.join_keys.size();
+		ref_vec = &state.join_keys.data[0];
+		ref_offset = build_rowid_offset;
+	}
 
 	idx_t result_count = 0;
-	FillProbeSelectionSwitch(state.join_keys.data[0], count, build_rowid_offset, bitmap_size, global_bitmap,
-	                         state.probe_sel_vec, state.build_sel_vec, result_count);
+	FillProbeSelectionSwitch(*ref_vec, count, ref_offset, bitmap_size, global_bitmap, state.probe_sel_vec,
+	                         state.build_sel_vec, result_count);
 
 	// LHS columns: reference directly when every row matched (inner join), else slice.
 	if (result_count == count) {

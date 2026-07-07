@@ -96,6 +96,19 @@ PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoi
 			hash_join.bitmap_join_resolved.pk = pk.get();
 			hash_join.bitmap_join_resolved.fk = nullptr; // not needed for BHJ build/probe
 			hash_join.bitmap_join_resolved.build_is_pk_side = true;
+			// Bitmap-Join (BHJ) hidden `_rowid`/`*_ref` columns (design doc 条目3): only set
+			// when the PK column itself is not a dense rowid. BitmapJoinResolver has already
+			// flattened these (alongside cond.left/cond.right) via ColumnBindingResolver, so
+			// they are now BoundReferenceExpressions pointing at a physical position within the
+			// build/probe chunk respectively. Left at DConstants::INVALID_INDEX (the default) in
+			// the common fast-path case, which BitmapJoinExecutor interprets as "reuse the join
+			// key value directly".
+			if (op.bhj_build_rowid_ref) {
+				hash_join.bitmap_build_rowid_idx = op.bhj_build_rowid_ref->Cast<BoundReferenceExpression>().index;
+			}
+			if (op.bhj_probe_ref_ref) {
+				hash_join.bitmap_probe_ref_idx = op.bhj_probe_ref_ref->Cast<BoundReferenceExpression>().index;
+			}
 		}
 		return join;
 	}

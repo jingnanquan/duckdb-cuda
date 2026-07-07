@@ -50,6 +50,22 @@ public:
 	//! SetForceResolvedPK override. Left null (the common case / open_bitmap_join=false) this
 	//! has zero effect on planning.
 	unique_ptr<BitmapJoinResolved> bhj_hint;
+	//! Hidden build-side `_rowid` column reference (design doc b_idea/6.4, 条目3). Filled in by
+	//! BitmapJoinResolver alongside `bhj_hint`, only when `bhj_hint->pk->rowid_column !=
+	//! bhj_hint->pk->pk_column` (i.e. the PK column is not itself a dense rowid, so a separately
+	//! materialized `_rowid` column must be scanned/propagated to this join instead). Starts out
+	//! as a plain BoundColumnRefExpression pointing at the (possibly newly injected) hidden
+	//! column on the build side; ColumnBindingResolver flattens it into a
+	//! BoundReferenceExpression the same way it does `conditions[i].right`, so
+	//! PlanComparisonJoin can read off the physical chunk index and wire up
+	//! PhysicalHashJoin::bitmap_build_rowid_idx. Left null in the common fast-path case (rowid ==
+	//! pk column) or when BHJ is not engaged at all.
+	unique_ptr<Expression> bhj_build_rowid_ref;
+	//! Hidden probe-side `*_ref` column reference (条目3), mirroring bhj_build_rowid_ref but for
+	//! the FK (probe) side and feeding PhysicalHashJoin::bitmap_probe_ref_idx. Always set/unset
+	//! in lockstep with bhj_build_rowid_ref (build/probe must agree on which rowid scheme is in
+	//! use - see BitmapJoinResolver::ResolveJoin).
+	unique_ptr<Expression> bhj_probe_ref_ref;
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
