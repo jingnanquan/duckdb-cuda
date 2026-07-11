@@ -43,7 +43,11 @@ struct RegistryResetGuard {
 };
 
 string ExplainText(Connection &con, const string &query) {
-	auto result = con.Query("EXPLAIN " + query);
+	// FORMAT JSON avoids the box-drawing renderer's line-wrapping of long extra_info values
+	// (e.g. "Bitmap Join: no (condition_not_plain_column)" would otherwise get split across
+	// multiple rendered cells/lines), so plain substring checks on the concatenated text stay
+	// reliable regardless of value length.
+	auto result = con.Query("EXPLAIN (FORMAT JSON) " + query);
 	REQUIRE(!result->HasError());
 	auto &materialized = result->Cast<MaterializedQueryResult>();
 	string text;
@@ -170,9 +174,16 @@ TEST_CASE("BitmapJoinResolver falls back safely when the FK table lands on the b
 
 	REQUIRE_NO_FAIL(*con.Query("SET open_bitmap_join=true"));
 
-	// The resolver must detect build_is_pk_side == false and leave bhj_hint unset: no marker,
-	// no exception, correct (regular hash join) results.
-	REQUIRE(!StringUtil::Contains(ExplainText(con, query), "Bitmap Join"));
+	// The resolver must detect build_is_pk_side == false and leave bhj_hint unset: no "yes"
+	// marker, no exception, correct (regular hash join) results. EXPLAIN now (b_idea/6.4遗漏
+	// 问题 条目6) does show a diagnostic "no (fk_on_build_side)" reason instead of nothing at
+	// all - assert that specific reason to double-check the diagnostic itself is accurate.
+	// FORMAT JSON renders extra_info as `"Bitmap Join": "no (...)"` (quote-colon-space, not
+	// "Bitmap Join: ") - match that exact shape.
+	auto plan = ExplainText(con, query);
+	REQUIRE(!StringUtil::Contains(plan, "\"Bitmap Join\": \"yes\""));
+	REQUIRE(StringUtil::Contains(plan, "\"Bitmap Join\""));
+	REQUIRE(StringUtil::Contains(plan, "no (fk_on_build_side)"));
 
 	auto result = RunAgg(con, query);
 	REQUIRE(result.cnt == 5);
@@ -194,9 +205,13 @@ TEST_CASE("BitmapJoinResolver has no effect on unrelated (unregistered) joins", 
 	                      "FROM bhj_neutral_a JOIN bhj_neutral_b ON bhj_neutral_a.x = bhj_neutral_b.x";
 
 	// The registry is empty (no bindings registered) - open_bitmap_join=true must be a pure
-	// no-op for this query: no BHJ marker, no crash, correct results.
+	// no-op for this query: no "yes" marker, no crash, correct results. Diagnostic reason
+	// (条目6) should be catalog_not_registered.
 	REQUIRE_NO_FAIL(*con.Query("SET open_bitmap_join=true"));
-	REQUIRE(!StringUtil::Contains(ExplainText(con, query), "Bitmap Join"));
+	auto plan = ExplainText(con, query);
+	REQUIRE(!StringUtil::Contains(plan, "\"Bitmap Join\": \"yes\""));
+	REQUIRE(StringUtil::Contains(plan, "\"Bitmap Join\""));
+	REQUIRE(StringUtil::Contains(plan, "catalog_not_registered"));
 
 	auto result = RunAgg(con, query);
 	REQUIRE(result.cnt == 3);
@@ -240,7 +255,10 @@ TEST_CASE("BitmapJoinResolver falls back safely for non-column-reference join co
 	                      "ON bhj_expr_fact.k + 1 = bhj_expr_dim.k";
 
 	REQUIRE_NO_FAIL(*con.Query("SET open_bitmap_join=true"));
-	REQUIRE(!StringUtil::Contains(ExplainText(con, query), "Bitmap Join"));
+	auto plan = ExplainText(con, query);
+	REQUIRE(!StringUtil::Contains(plan, "\"Bitmap Join\": \"yes\""));
+	REQUIRE(StringUtil::Contains(plan, "\"Bitmap Join\""));
+	REQUIRE(StringUtil::Contains(plan, "condition_not_plain_column"));
 
 	auto result = RunAgg(con, query);
 	REQUIRE(result.cnt == 3);

@@ -1680,6 +1680,11 @@ InsertionOrderPreservingMap<string> PhysicalHashJoin::ParamsToString() const {
 
 	if (use_bitmap_join) {
 		result["Bitmap Join"] = "yes";
+	} else if (bhj_skip_reason != BitmapJoinSkipReason::NOT_PROCESSED &&
+	           bhj_skip_reason != BitmapJoinSkipReason::HIT) {
+		// 条目6 (b_idea/6.4遗漏问题): purely diagnostic - shows why BitmapJoinResolver didn't
+		// wire this join up, without needing one-off debug prints to find out.
+		result["Bitmap Join"] = "no (" + BitmapJoinSkipReasonToString(bhj_skip_reason) + ")";
 	}
 
 	SetEstimatedCardinality(result, estimated_cardinality);

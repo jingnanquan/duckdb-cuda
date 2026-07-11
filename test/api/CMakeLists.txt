@@ -42,7 +42,8 @@ set(TEST_API_OBJECTS
     test_bitmap_join_auto_resolve.cpp
     test_bitmap_join_rowid_ref.cpp
     test_bitmap_join_chain.cpp
-    test_bitmap_join_tpch.cpp)
+    test_bitmap_join_tpch.cpp
+    test_bitmap_join_tpch_profile.cpp)
 
 if(NOT WIN32)
   set(TEST_API_OBJECTS ${TEST_API_OBJECTS} test_read_only.cpp)
@@ -53,6 +54,7 @@ if(DUCKDB_EXTENSION_TPCH_SHOULD_LINK)
   set(TEST_API_OBJECTS
       ${TEST_API_OBJECTS} test_tpch_with_relations.cpp
       test_tpch_with_streaming.cpp
+      test_bitmap_join_tpch_22queries.cpp
       serialized_plans/test_plan_serialization_bwc.cpp)
 endif()
 

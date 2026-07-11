@@ -5,6 +5,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -47,6 +48,17 @@ struct TracedBinding {
 	//! 1/2) regardless of this flag - it only gates whether hidden-column propagation (条目3/4)
 	//! may be attempted using `path`.
 	bool path_complete = true;
+	//! Diagnostic-only (b_idea/6.4遗漏问题, 条目6): true iff `path_complete` was downgraded to
+	//! false specifically because the trace crossed the LEFT side of an intermediate INNER join
+	//! (the one, specific, documented, *potentially fixable* limitation - see 条目8) rather than
+	//! some other unsupported operator (Aggregate, non-INNER join, etc). Never read by any
+	//! planning/execution decision, only by ResolveJoin to fill in bhj_skip_reason.
+	bool incomplete_due_to_left_side = false;
+	//! Diagnostic-only (b_idea/6.4遗漏问题 任务1 条目6): true iff this trace failed (get ==
+	//! nullptr) specifically because it hit a CompressedMaterialization-inserted
+	//! compress/decompress wrapper around what would otherwise have been a plain column
+	//! reference - as opposed to a genuine computed expression or any other unsupported shape.
+	bool blocked_by_compressed_materialization = false;
 };
 
 //! Returns the ColumnBinding of `expr` if it is (still) a plain BoundColumnRefExpression, or
@@ -56,6 +68,22 @@ optional_ptr<const ColumnBinding> GetPlainColumnBinding(const Expression &expr) 
 		return nullptr;
 	}
 	return &expr.Cast<BoundColumnRefExpression>().binding;
+}
+
+//! Diagnostic-only (b_idea/6.4遗漏问题 任务1 条目6): true iff `expr` is specifically an
+//! `__internal_compress_integral_*`/`__internal_decompress_integral_*` wrapper inserted by the
+//! CompressedMaterialization optimizer pass (runs during statistics propagation, well before
+//! BitmapJoinResolver) around an otherwise-plain column reference. Distinguishing this from a
+//! genuine computed expression matters: it is a *specific, known, upstream-optimizer-driven*
+//! cause (observed on real SF5 Q9/Q10 joins, not a hypothetical), as opposed to
+//! CONDITION_NOT_PLAIN_COLUMN's fully generic "some arbitrary expression" case.
+bool IsCompressedMaterializationWrapper(const Expression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &func_name = expr.Cast<BoundFunctionExpression>().function.name;
+	return StringUtil::StartsWith(func_name, "__internal_compress_integral_") ||
+	       StringUtil::StartsWith(func_name, "__internal_decompress_integral_");
 }
 
 //! Walks down from `op`, following `binding` through at most a chain of LOGICAL_PROJECTION
@@ -87,11 +115,17 @@ TracedBinding TraceBindingToGet(LogicalOperator &op, ColumnBinding binding) {
 			if (binding.column_index >= proj.expressions.size()) {
 				return TracedBinding();
 			}
-			auto plain = GetPlainColumnBinding(*proj.expressions[binding.column_index]);
+			auto &proj_expr = *proj.expressions[binding.column_index];
+			auto plain = GetPlainColumnBinding(proj_expr);
 			if (!plain) {
 				// Not a plain pass-through column (e.g. a computed expression) - can't trace
 				// further back with our scope. Safe fallback: skip BHJ for this join.
-				return TracedBinding();
+				// 条目6 diagnostic: specifically flag the CompressedMaterialization case (see
+				// b_idea/6.4遗漏问题 任务1) rather than lump it into the fully generic
+				// "some computed expression" bucket - it's a distinct, known, fixable cause.
+				TracedBinding result;
+				result.blocked_by_compressed_materialization = IsCompressedMaterializationWrapper(proj_expr);
+				return result;
 			}
 			auto result = TraceBindingToGet(*op.children[0], *plain);
 			if (result.get) {
@@ -142,6 +176,7 @@ TracedBinding TraceBindingToGet(LogicalOperator &op, ColumnBinding binding) {
 		if (left_result.get) {
 			// LEFT side: never safe to grow - see comment above.
 			left_result.path_complete = false;
+			left_result.incomplete_due_to_left_side = true;
 			return left_result;
 		}
 		auto right_result = TraceBindingToGet(*op.children[1], binding);
@@ -395,11 +430,25 @@ void BitmapJoinResolver::VisitOperator(LogicalOperator &op) {
 
 void BitmapJoinResolver::ResolveJoin(LogicalComparisonJoin &op) {
 	// Same eligibility test as plan_comparison_join.cpp's `bhj_eligible`: a single equality
-	// condition on an INNER / RIGHT_SEMI join (design doc §1.3 Step C).
-	bool bhj_eligible = op.conditions.size() == 1 &&
-	                    op.conditions[0].comparison == ExpressionType::COMPARE_EQUAL &&
-	                    (op.join_type == JoinType::INNER || op.join_type == JoinType::RIGHT_SEMI);
-	if (!bhj_eligible) {
+	// condition on an INNER join.
+	// NOTE (b_idea/6.4遗漏问题 任务1 条目7/条目9): this used to also allow RIGHT_SEMI, but
+	// BitmapJoinExecutor only ever supported JoinType::INNER, so a RIGHT_SEMI join we wired up a
+	// bhj_hint for (e.g. real TPCH Q20's decorrelated `IN` subquery) would throw
+	// NotImplementedException at construction time instead of safely falling back - a real,
+	// reproduced crash on open_bitmap_join=true. Tightened to INNER-only to match what the
+	// executor actually supports (mirrored in plan_comparison_join.cpp's bhj_eligible); see task2
+	// 条目9 for whether RIGHT_SEMI support is worth adding properly in the future.
+	bool single_equality = op.conditions.size() == 1 && op.conditions[0].comparison == ExpressionType::COMPARE_EQUAL;
+	if (!single_equality) {
+		// 条目6: intentionally distinguish "not a single equality condition" from "wrong join
+		// type" below, even though both currently short-circuit the same way - a future reader
+		// asking "why didn't Q9's ps_partkey=l_partkey AND ps_suppkey=l_suppkey join hit BHJ"
+		// should get a precise, greppable answer straight from EXPLAIN.
+		op.bhj_skip_reason = BitmapJoinSkipReason::NOT_SINGLE_EQUALITY;
+		return;
+	}
+	if (op.join_type != JoinType::INNER) {
+		op.bhj_skip_reason = BitmapJoinSkipReason::NOT_INNER_OR_RIGHT_SEMI;
 		return;
 	}
 
@@ -410,6 +459,7 @@ void BitmapJoinResolver::ResolveJoin(LogicalComparisonJoin &op) {
 	auto build_binding = GetPlainColumnBinding(*cond.right);
 	if (!probe_binding || !build_binding) {
 		// Condition side is not a plain column reference (e.g. a cast/expression) - skip.
+		op.bhj_skip_reason = BitmapJoinSkipReason::CONDITION_NOT_PLAIN_COLUMN;
 		return;
 	}
 
@@ -421,6 +471,13 @@ void BitmapJoinResolver::ResolveJoin(LogicalComparisonJoin &op) {
 		// Could not trace back to a base LogicalGet (e.g. buried under an aliased subquery, a
 		// computed expression, or some other operator we don't unwrap) - skip; safe fallback to
 		// a regular hash join.
+		// 条目6: distinguish the specific, diagnosable CompressedMaterialization-wrapper case
+		// (observed on real SF5 Q9/Q10 - see b_idea/6.4遗漏问题 任务1) from the fully generic
+		// "trace failed for some other reason" bucket.
+		op.bhj_skip_reason = (probe_trace.blocked_by_compressed_materialization ||
+		                       build_trace.blocked_by_compressed_materialization)
+		                          ? BitmapJoinSkipReason::CONDITION_WRAPPED_BY_COMPRESSED_MATERIALIZATION
+		                          : BitmapJoinSkipReason::TRACE_TO_GET_FAILED;
 		return;
 	}
 
@@ -429,17 +486,20 @@ void BitmapJoinResolver::ResolveJoin(LogicalComparisonJoin &op) {
 	string probe_table = ResolveLogicalTableName(*probe_trace.get);
 	string probe_col = ResolveColumnName(*probe_trace.get, probe_trace.get_column_index);
 	if (build_table.empty() || build_col.empty() || probe_table.empty() || probe_col.empty()) {
+		op.bhj_skip_reason = BitmapJoinSkipReason::CATALOG_NAME_RESOLUTION_FAILED;
 		return;
 	}
 
 	BitmapJoinResolved resolved;
 	if (!BitmapJoinMetaRegistry::Get(context).TryResolve(build_table, build_col, probe_table, probe_col, resolved)) {
+		op.bhj_skip_reason = BitmapJoinSkipReason::CATALOG_NOT_REGISTERED;
 		return;
 	}
 	if (!resolved.build_is_pk_side) {
 		// The FK (fact) table landed on the build side: BHJ's core precondition (unique
 		// build-side keys) is violated. Silently fall back to a regular hash join rather than
 		// wiring up a hint BitmapJoinExecutor cannot support (design doc 条目2).
+		op.bhj_skip_reason = BitmapJoinSkipReason::FK_ON_BUILD_SIDE;
 		return;
 	}
 
@@ -450,15 +510,23 @@ void BitmapJoinResolver::ResolveJoin(LogicalComparisonJoin &op) {
 	// bail out entirely (regular hash join) rather than risk a rowid-scheme mismatch.
 	if (resolved.pk->rowid_column != resolved.pk->pk_column) {
 		if (!resolved.fk || resolved.fk->ref_column.empty()) {
+			op.bhj_skip_reason = BitmapJoinSkipReason::ROWID_MODE_MISMATCH;
 			return;
 		}
 		if (!build_trace.path_complete || !probe_trace.path_complete) {
+			// 条目6: distinguish the one, specific, potentially-fixable cause (LEFT-side of an
+			// intermediate join, 条目8) from every other unsupported-operator case, so EXPLAIN
+			// can directly tell them apart without re-deriving it from the plan by hand.
+			op.bhj_skip_reason = (build_trace.incomplete_due_to_left_side || probe_trace.incomplete_due_to_left_side)
+			                         ? BitmapJoinSkipReason::PATH_INCOMPLETE_LEFT_SIDE
+			                         : BitmapJoinSkipReason::PATH_INCOMPLETE_OTHER;
 			return;
 		}
 		op.bhj_build_rowid_ref = PropagateHiddenColumn(*build_trace.get, build_trace.path, resolved.pk->rowid_column);
 		op.bhj_probe_ref_ref = PropagateHiddenColumn(*probe_trace.get, probe_trace.path, resolved.fk->ref_column);
 	}
 	op.bhj_hint = make_uniq<BitmapJoinResolved>(resolved);
+	op.bhj_skip_reason = BitmapJoinSkipReason::HIT;
 }
 
 } // namespace duckdb

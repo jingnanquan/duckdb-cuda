@@ -278,3 +278,43 @@ TEST_CASE("BHJ hidden column re-injection across two joins sharing the same unde
 		REQUIRE(last.sum2 == 2400);
 	}
 }
+
+TEST_CASE("BHJ safely falls back to a regular hash join for RIGHT_SEMI (does not crash)",
+          "[bitmap_join]") {
+	// Regression test for a real crash found via the TPC-H Q20 smoke test (b_idea/6.4遗漏问题
+	// 任务1 §7.6 / 任务2 条目9): an `IN` subquery decorrelates into a RIGHT_SEMI
+	// LogicalComparisonJoin. BitmapJoinResolver used to allow RIGHT_SEMI into bhj_eligible, but
+	// BitmapJoinExecutor's constructor only ever supported JoinType::INNER - so if the RIGHT_SEMI
+	// join's condition also happened to match a registered PK/FK binding (exactly as in Q20,
+	// where `partsupp` is both semi-joined via IN *and* has a materialized rowid binding), the
+	// mismatch threw NotImplementedException instead of safely falling back, crashing the whole
+	// query. Fixed by tightening bhj_eligible (in both BitmapJoinResolver::ResolveJoin and
+	// plan_comparison_join.cpp) to JoinType::INNER only. This test pins that fix down: even when
+	// the PK table (`bhj_chain_customer`, ck is registered as a PK) is on the semi-joined side, a
+	// query must never throw - not even NotImplementedException.
+	RegistryResetGuard guard;
+	auto &reg = BitmapJoinMetaRegistry::GetInstance();
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	SetupChainSchema(con, reg, /*with_nation=*/false);
+
+	// `o.ck IN (SELECT ck FROM bhj_chain_customer)` decorrelates into a semi join whose
+	// non-probe side is `bhj_chain_customer` - the same PK table registered via
+	// SetupChainSchema, so BitmapJoinResolver will actually attempt to resolve it (not skip it
+	// for lack of a registered binding), exercising the exact code path that used to crash.
+	const string query = "SELECT count(*) AS cnt FROM bhj_chain_orders o "
+	                      "WHERE o.ck IN (SELECT ck FROM bhj_chain_customer)";
+
+	REQUIRE_NO_FAIL(*con.Query("SET open_bitmap_join=false"));
+	auto baseline_result = con.Query(query);
+	REQUIRE_NO_FAIL(*baseline_result);
+	auto baseline_cnt = baseline_result->Cast<MaterializedQueryResult>().GetValue(0, 0).GetValue<int64_t>();
+
+	REQUIRE_NO_FAIL(*con.Query("SET open_bitmap_join=true"));
+	// The key assertion: must not throw (NotImplementedException or otherwise), regardless of
+	// whether the underlying join type ends up being SEMI, RIGHT_SEMI, or something else.
+	auto bhj_result = con.Query(query);
+	REQUIRE_NO_FAIL(*bhj_result);
+	REQUIRE(bhj_result->Cast<MaterializedQueryResult>().GetValue(0, 0).GetValue<int64_t>() == baseline_cnt);
+}

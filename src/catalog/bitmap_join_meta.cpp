@@ -13,6 +13,42 @@ using namespace duckdb_yyjson; // NOLINT
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
+// Diagnostics (b_idea/6.4遗漏问题, 条目6)
+//===--------------------------------------------------------------------===//
+string BitmapJoinSkipReasonToString(BitmapJoinSkipReason reason) {
+	switch (reason) {
+	case BitmapJoinSkipReason::NOT_PROCESSED:
+		return "not_processed";
+	case BitmapJoinSkipReason::HIT:
+		return "hit";
+	case BitmapJoinSkipReason::NOT_SINGLE_EQUALITY:
+		return "not_single_equality";
+	case BitmapJoinSkipReason::NOT_INNER_OR_RIGHT_SEMI:
+		return "not_inner_or_right_semi";
+	case BitmapJoinSkipReason::CONDITION_NOT_PLAIN_COLUMN:
+		return "condition_not_plain_column";
+	case BitmapJoinSkipReason::CONDITION_WRAPPED_BY_COMPRESSED_MATERIALIZATION:
+		return "condition_wrapped_by_compressed_materialization";
+	case BitmapJoinSkipReason::TRACE_TO_GET_FAILED:
+		return "trace_to_get_failed";
+	case BitmapJoinSkipReason::CATALOG_NAME_RESOLUTION_FAILED:
+		return "catalog_name_resolution_failed";
+	case BitmapJoinSkipReason::CATALOG_NOT_REGISTERED:
+		return "catalog_not_registered";
+	case BitmapJoinSkipReason::FK_ON_BUILD_SIDE:
+		return "fk_on_build_side";
+	case BitmapJoinSkipReason::ROWID_MODE_MISMATCH:
+		return "rowid_mode_mismatch";
+	case BitmapJoinSkipReason::PATH_INCOMPLETE_LEFT_SIDE:
+		return "path_incomplete_left_side";
+	case BitmapJoinSkipReason::PATH_INCOMPLETE_OTHER:
+		return "path_incomplete_other";
+	default:
+		return "unknown";
+	}
+}
+
+//===--------------------------------------------------------------------===//
 // Singleton
 //===--------------------------------------------------------------------===//
 BitmapJoinMetaRegistry &BitmapJoinMetaRegistry::GetInstance() {

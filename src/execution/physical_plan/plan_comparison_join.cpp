@@ -56,11 +56,20 @@ PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoi
 	prefer_range_joins = prefer_range_joins && can_iejoin;
 	if (has_equality && !prefer_range_joins) {
 		// Detect Bitmap-Join (BHJ) eligibility BEFORE op.conditions is moved into the operator
-		// (design §6.3): single equality condition on an INNER / RIGHT_SEMI join.
-		// 只有一个比较符号
-		bool bhj_eligible = op.conditions.size() == 1 &&
-		                    op.conditions[0].comparison == ExpressionType::COMPARE_EQUAL &&
-		                    (op.join_type == JoinType::INNER || op.join_type == JoinType::RIGHT_SEMI);
+		// (design §6.3): single equality condition on an INNER join.
+		// NOTE (b_idea/6.4遗漏问题 任务1 条目7/条目9): this used to also allow RIGHT_SEMI, but
+		// BitmapJoinExecutor's constructor only ever supported JoinType::INNER (see
+		// bitmap_hash_join_executor.cpp) - so a RIGHT_SEMI join that BitmapJoinResolver had
+		// wired up a bhj_hint for (e.g. real TPCH Q20's `s_suppkey IN (SELECT ps_suppkey FROM
+		// partsupp WHERE ...)` decorrelates into exactly this shape) would hit a
+		// NotImplementedException at construction time instead of safely falling back to a
+		// regular hash join - a real, reproduced crash on open_bitmap_join=true, caught by the
+		// 22-query TPC-H smoke test. Tightened to INNER-only here (and in
+		// BitmapJoinResolver::ResolveJoin) to match what the executor actually supports; see
+		// task2 条目9 for whether RIGHT_SEMI support is worth adding properly in the future.
+		bool bhj_eligible =
+		    op.conditions.size() == 1 && op.conditions[0].comparison == ExpressionType::COMPARE_EQUAL &&
+		    op.join_type == JoinType::INNER;
 
 		// Equality join with small number of keys : possible perfect join optimization
 		auto &join = Make<PhysicalHashJoin>(op, left, right, std::move(op.conditions), op.join_type,
@@ -68,6 +77,10 @@ PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoi
 		                                    op.estimated_cardinality, std::move(op.filter_pushdown));
 		auto &hash_join = join.Cast<PhysicalHashJoin>();
 		hash_join.join_stats = std::move(op.join_stats);
+		// 条目6 (b_idea/6.4遗漏问题): carry the diagnostic-only skip reason over to the physical
+		// operator so EXPLAIN can display it via ParamsToString.
+		hash_join.bhj_skip_reason = op.bhj_skip_reason;
+
 
 		// Bitmap-Join hook: plan-time enablement. Two paths feed into the same PK binding:
 		//   1. Test-only force override (BitmapJoinMetaRegistry::SetForceResolvedPK), kept as a

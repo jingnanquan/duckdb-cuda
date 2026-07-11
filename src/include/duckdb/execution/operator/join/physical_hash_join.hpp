@@ -70,6 +70,10 @@ public:
 	idx_t bitmap_build_rowid_idx = DConstants::INVALID_INDEX;
 	//! Index of the probe-side *_ref column within the probe chunk.
 	idx_t bitmap_probe_ref_idx = DConstants::INVALID_INDEX;
+	//! Diagnostic-only (b_idea/6.4遗漏问题, 条目6): copy of
+	//! LogicalComparisonJoin::bhj_skip_reason, taken at PlanComparisonJoin time. Only consumed
+	//! by ParamsToString for EXPLAIN output; never affects execution.
+	BitmapJoinSkipReason bhj_skip_reason = BitmapJoinSkipReason::NOT_PROCESSED;
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;

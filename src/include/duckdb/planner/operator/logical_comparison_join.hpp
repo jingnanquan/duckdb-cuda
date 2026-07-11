@@ -66,6 +66,11 @@ public:
 	//! in lockstep with bhj_build_rowid_ref (build/probe must agree on which rowid scheme is in
 	//! use - see BitmapJoinResolver::ResolveJoin).
 	unique_ptr<Expression> bhj_probe_ref_ref;
+	//! Diagnostic-only (b_idea/6.4遗漏问题, 条目6): why BitmapJoinResolver did/didn't produce
+	//! bhj_hint for this node. NOT_PROCESSED if the pass never ran (open_bitmap_join=false).
+	//! Purely informational - never influences any planning/execution decision - so that
+	//! EXPLAIN can show a reason for every HASH_JOIN node without one-off debug prints.
+	BitmapJoinSkipReason bhj_skip_reason = BitmapJoinSkipReason::NOT_PROCESSED;
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
