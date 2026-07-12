@@ -124,6 +124,14 @@ private:
 	column_binding_map_t<unique_ptr<BaseStatistics>> statistics_map;
 	//! Node stats for the current node
 	unique_ptr<NodeStatistics> node_stats;
+	//! 条目8b (b_idea/6.4遗漏问题 任务2): computed once, lazily, on first use (see
+	//! PropagateStatistics(LogicalOperator&, ...)) - see CompressedMaterialization::
+	//! CollectBhjProtectedBindings for why this must be collected over the whole, unmodified
+	//! plan before any compression begins, rather than incrementally as each join is visited.
+	//! Empty (and never populated) when open_bitmap_join=false, so there is zero overhead on the
+	//! default path.
+	column_binding_set_t bhj_protected_bindings;
+	bool bhj_protected_bindings_computed = false;
 };
 
 } // namespace duckdb

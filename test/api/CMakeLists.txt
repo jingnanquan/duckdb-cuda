@@ -43,7 +43,8 @@ set(TEST_API_OBJECTS
     test_bitmap_join_rowid_ref.cpp
     test_bitmap_join_chain.cpp
     test_bitmap_join_tpch.cpp
-    test_bitmap_join_tpch_profile.cpp)
+    test_bitmap_join_tpch_profile.cpp
+    test_bitmap_join_compressed_materialization.cpp)
 
 if(NOT WIN32)
   set(TEST_API_OBJECTS ${TEST_API_OBJECTS} test_read_only.cpp)

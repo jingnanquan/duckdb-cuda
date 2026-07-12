@@ -8,7 +8,10 @@ void CompressedMaterialization::CompressDistinct(unique_ptr<LogicalOperator> &op
 	auto &distinct = op->Cast<LogicalDistinct>();
 	auto &distinct_targets = distinct.distinct_targets;
 
-	column_binding_set_t referenced_bindings;
+	// 条目8b (b_idea/6.4遗漏问题 任务2): seed with every binding some INNER join elsewhere in the
+	// plan uses as an equality-condition operand (see CollectBhjProtectedBindings). No-op when
+	// open_bitmap_join=false.
+	column_binding_set_t referenced_bindings = bhj_protected_bindings;
 	for (auto &target : distinct_targets) {
 		if (target->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) { // LCOV_EXCL_START
 			GetReferencedBindings(*target, referenced_bindings);

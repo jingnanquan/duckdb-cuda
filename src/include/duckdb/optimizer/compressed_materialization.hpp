@@ -84,9 +84,26 @@ private:
 	static constexpr double JOIN_CARDINALITY_RATIO_THRESHOLD = 8;
 
 public:
-	CompressedMaterialization(Optimizer &optimizer, LogicalOperator &root, statistics_map_t &statistics_map);
+	CompressedMaterialization(Optimizer &optimizer, LogicalOperator &root, statistics_map_t &statistics_map,
+	                          const column_binding_set_t &bhj_protected_bindings);
 
 	void Compress(unique_ptr<LogicalOperator> &op);
+
+	//! 条目8b (b_idea/6.4遗漏问题 任务2): one-time, read-only, whole-plan walk (called once by
+	//! StatisticsPropagator, before any compression begins) collecting every ColumnBinding that
+	//! participates as either side of some single-equality INNER join's condition *anywhere* in
+	//! the plan - not just the join currently being compressed. This is necessary because
+	//! CompressedMaterialization runs bottom-up, one materializing operator at a time: a column
+	//! that is merely a *payload* column at some lower join/aggregate (and would otherwise be
+	//! compressed there as an ordinary optimization) may still be the literal join-key operand of
+	//! some *ancestor* join further up the plan - e.g. real SF5 Q10's `orders.o_custkey` is a
+	//! payload column of the `lineitem JOIN orders` join, but the literal equality-condition
+	//! operand of the ancestor `customer JOIN (...)` join. Compressing it at the lower join wraps
+	//! it in an `__internal_compress_integral_*` function that BitmapJoinResolver::
+	//! TraceBindingToGet (running after this entire pass) cannot see through, silently disabling
+	//! BHJ for the ancestor join even though that ancestor join's *own* condition was never
+	//! touched. See bhj_protected_bindings for how the result is consumed.
+	static void CollectBhjProtectedBindings(LogicalOperator &op, column_binding_set_t &out);
 
 private:
 	//! Compress materializing operators
@@ -136,6 +153,12 @@ private:
 	optional_ptr<LogicalOperator> root;
 	//! The map of ColumnBinding -> statistics for the various nodes
 	statistics_map_t &statistics_map;
+	//! 条目8b (b_idea/6.4遗漏问题 任务2): bindings that must never be compressed anywhere in the
+	//! plan because some INNER join *somewhere* (not necessarily the join currently being
+	//! compressed) uses them as an equality-condition operand and open_bitmap_join=true - see
+	//! CollectBhjProtectedBindings. Computed once by StatisticsPropagator before any compression
+	//! begins; empty (and thus zero-overhead) whenever open_bitmap_join=false.
+	const column_binding_set_t &bhj_protected_bindings;
 };
 
 } // namespace duckdb

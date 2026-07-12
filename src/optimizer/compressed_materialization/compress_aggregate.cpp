@@ -33,7 +33,12 @@ void CompressedMaterialization::CompressAggregate(unique_ptr<LogicalOperator> &o
 	// Find all bindings referenced by non-colref expressions in the groups
 	// These are excluded from compression by projection
 	// But we can try to compress the expression directly
-	column_binding_set_t referenced_bindings;
+	// 条目8b (b_idea/6.4遗漏问题 任务2): seed with every binding some INNER join elsewhere in the
+	// plan uses as an equality-condition operand (see CollectBhjProtectedBindings) - this
+	// aggregate's child columns feed CMChildInfo's can_compress via this same set, so a column
+	// that is merely a payload of this aggregate but the literal join key of some *ancestor*
+	// join is protected here too. No-op when open_bitmap_join=false (set is empty then).
+	column_binding_set_t referenced_bindings = bhj_protected_bindings;
 	vector<ColumnBinding> group_bindings(groups.size(), ColumnBinding());
 	vector<bool> needs_decompression(groups.size(), false);
 	vector<unique_ptr<BaseStatistics>> stored_group_stats;

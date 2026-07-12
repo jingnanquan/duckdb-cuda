@@ -7,9 +7,11 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/topn_optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 
 namespace duckdb {
@@ -43,8 +45,37 @@ CompressExpression::CompressExpression(unique_ptr<Expression> expression_p, uniq
 }
 
 CompressedMaterialization::CompressedMaterialization(Optimizer &optimizer_p, LogicalOperator &root_p,
-                                                     statistics_map_t &statistics_map_p)
-    : optimizer(optimizer_p), context(optimizer.context), root(&root_p), statistics_map(statistics_map_p) {
+                                                     statistics_map_t &statistics_map_p,
+                                                     const column_binding_set_t &bhj_protected_bindings_p)
+    : optimizer(optimizer_p), context(optimizer.context), root(&root_p), statistics_map(statistics_map_p),
+      bhj_protected_bindings(bhj_protected_bindings_p) {
+}
+
+void CompressedMaterialization::CollectBhjProtectedBindings(LogicalOperator &op, column_binding_set_t &out) {
+	// 条目8b (b_idea/6.4遗漏问题 任务2): mirrors plan_comparison_join.cpp's/BitmapJoinResolver's
+	// `bhj_eligible` test (single equality condition, JoinType::INNER) - anything that could
+	// plausibly become a Bitmap-Join key downstream. Deliberately does NOT check
+	// BitmapJoinMetaRegistry (see compress_comparison_join.cpp for the rationale: that lookup is
+	// BitmapJoinResolver's job, over-protecting has no correctness cost). Must be run once, over
+	// the *entire, still-unmodified* plan, before any compression begins - the plan's join
+	// shape/conditions are already final at this point (JOIN_ORDER/BUILD_SIDE_PROBE_SIDE have
+	// both already run), but CompressedMaterialization itself has not yet touched anything.
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = op.Cast<LogicalComparisonJoin>();
+		if (join.conditions.size() == 1 && join.join_type == JoinType::INNER &&
+		    join.conditions[0].comparison == ExpressionType::COMPARE_EQUAL) {
+			auto &cond = join.conditions[0];
+			if (cond.left->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+				out.insert(cond.left->Cast<BoundColumnRefExpression>().binding);
+			}
+			if (cond.right->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+				out.insert(cond.right->Cast<BoundColumnRefExpression>().binding);
+			}
+		}
+	}
+	for (auto &child : op.children) {
+		CollectBhjProtectedBindings(*child, out);
+	}
 }
 
 void CompressedMaterialization::GetReferencedBindings(const Expression &root_expr,

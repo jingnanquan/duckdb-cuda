@@ -1,6 +1,7 @@
 #include "duckdb/optimizer/statistics_propagator.hpp"
 
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/compressed_materialization.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/expression/list.hpp"
@@ -82,8 +83,21 @@ unique_ptr<NodeStatistics> StatisticsPropagator::PropagateStatistics(LogicalOper
 	}
 
 	if (!optimizer.OptimizerDisabled(OptimizerType::COMPRESSED_MATERIALIZATION)) {
+		// 条目8b (b_idea/6.4遗漏问题 任务2): computed lazily on first use, once, over the whole
+		// (still-unmodified at this point in the overall pass, since this is the very first
+		// materializing node PropagateStatistics visits bottom-up) plan - see
+		// CompressedMaterialization::CollectBhjProtectedBindings for why a single global,
+		// upfront pass is required instead of only ever protecting the join currently being
+		// compressed. Left empty (zero overhead) when open_bitmap_join=false.
+		if (!bhj_protected_bindings_computed) {
+			bhj_protected_bindings_computed = true;
+			if (Settings::Get<OpenBitmapJoinSetting>(context)) {
+				CompressedMaterialization::CollectBhjProtectedBindings(*root, bhj_protected_bindings);
+			}
+		}
 		// compress data based on statistics for materializing operators
-		CompressedMaterialization compressed_materialization(optimizer, *root, statistics_map);
+		CompressedMaterialization compressed_materialization(optimizer, *root, statistics_map,
+		                                                      bhj_protected_bindings);
 		compressed_materialization.Compress(node_ptr);
 	}
 

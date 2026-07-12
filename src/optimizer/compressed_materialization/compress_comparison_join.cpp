@@ -52,13 +52,33 @@ void CompressedMaterialization::CompressComparisonJoin(unique_ptr<LogicalOperato
 	// These are excluded from compression by projection
 	// But we can try to compress the expression directly
 	column_binding_set_t probe_compress_bindings;
-	column_binding_set_t referenced_bindings;
+	// 条目8b (b_idea/6.4遗漏问题 任务2): seed referenced_bindings with every binding that
+	// CollectBhjProtectedBindings determined is some INNER join's equality-condition operand
+	// *anywhere* in the plan (not just this join) - this is what actually prevents compression,
+	// via the same "referenced/excluded" mechanism TryCompressChild already honors for every
+	// other reason a column can't be compressed (see compressed_materialization.cpp). Cheap and
+	// a complete no-op when open_bitmap_join=false (bhj_protected_bindings is empty then).
+	column_binding_set_t referenced_bindings = bhj_protected_bindings;
 	for (const auto &condition : join.conditions) {
 		if (join.conditions.size() == 1 && join.type != LogicalOperatorType::LOGICAL_DELIM_JOIN) {
 			// We only try to compress the join condition cols if there's one join condition
 			// Else it gets messy with the stats if one column shows up in multiple conditions
 			if (condition.left->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
 			    condition.right->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+				auto &lhs_colref_peek = condition.left->Cast<BoundColumnRefExpression>();
+				auto &rhs_colref_peek = condition.right->Cast<BoundColumnRefExpression>();
+				// 条目8b: this join's own condition columns are already in bhj_protected_bindings
+				// whenever they qualify (see CollectBhjProtectedBindings) - skip the "compress
+				// generically via a merged-stats projection" fast path for them too, otherwise
+				// it would compress them here regardless of the referenced_bindings exclusion
+				// (that fast path bypasses referenced_bindings entirely, going straight through
+				// statistics_map instead).
+				if (bhj_protected_bindings.find(lhs_colref_peek.binding) != bhj_protected_bindings.end() ||
+				    bhj_protected_bindings.find(rhs_colref_peek.binding) != bhj_protected_bindings.end()) {
+					GetReferencedBindings(*condition.left, referenced_bindings);
+					GetReferencedBindings(*condition.right, referenced_bindings);
+					continue;
+				}
 				// Both are bound column refs, see if both can be compressed generically to the same type
 				auto &lhs_colref = condition.left->Cast<BoundColumnRefExpression>();
 				auto &rhs_colref = condition.right->Cast<BoundColumnRefExpression>();

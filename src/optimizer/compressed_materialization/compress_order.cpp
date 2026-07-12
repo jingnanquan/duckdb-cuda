@@ -10,7 +10,10 @@ void CompressedMaterialization::CompressOrder(unique_ptr<LogicalOperator> &op) {
 	// Find all bindings referenced by non-colref expressions in the order nodes
 	// These are excluded from compression by projection
 	// But we can try to compress the expression directly
-	column_binding_set_t referenced_bindings;
+	// 条目8b (b_idea/6.4遗漏问题 任务2): seed with every binding some INNER join elsewhere in the
+	// plan uses as an equality-condition operand (see CollectBhjProtectedBindings). No-op when
+	// open_bitmap_join=false.
+	column_binding_set_t referenced_bindings = bhj_protected_bindings;
 	for (idx_t order_node_idx = 0; order_node_idx < order.orders.size(); order_node_idx++) {
 		auto &bound_order = order.orders[order_node_idx];
 		auto &order_expression = *bound_order.expression;

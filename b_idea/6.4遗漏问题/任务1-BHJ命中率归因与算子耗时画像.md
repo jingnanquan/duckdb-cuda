@@ -81,7 +81,7 @@ Q10,bitmap,3,1,...   -> 3个HASH_JOIN，命中1个
 2. Q5 唯一的"可优化类"未命中，才是任务2条目8瞄准的场景（`lineitem⋈[orders+customer+nation+region]`，`lineitem` 是探测/事实侧，`orders` 一侧在中间 join 里落在了 LEFT）。
 3. 无解类（`not_single_equality`）在三条查询里各出现一次，都是"多列等值条件"的天然限制（设计文档 Q6 open question），不建议投入解决。
 
-**对任务2的优先级建议（更新）**：`CONDITION_WRAPPED_BY_COMPRESSED_MATERIALIZATION` 这个新发现的问题，影响面（Q9 1个 + Q10 2个 = 3个）比 `PATH_INCOMPLETE_LEFT_SIDE`（仅 Q5 1个）更大，且根因更集中（`TraceBindingToGet` 在 `LOGICAL_PROJECTION` 分支只认"纯列引用"，无法看穿一层已知的、语义上无损的压缩/解压包装）——**建议作为任务2新增的条目8b，优先于/并行于条目8（LEFT侧优化）解决**：只需在 `GetPlainColumnBinding`/`TraceBindingToGet` 里增加"看穿一层 `__internal_compress_integral_*`/`__internal_decompress_integral_*`"的逻辑（记录下这一层压缩函数，在最终读到物理列值后需要再解压一次），比条目8的"旁路直通列"方案改动量小得多。
+**对任务2的优先级建议（更新，v2：条目8b已实施）**：`CONDITION_WRAPPED_BY_COMPRESSED_MATERIALIZATION` 这个新发现的问题，已作为任务2条目8b 实施并通过真实数据验证——采用的是"全局预扫描 + 源头跳过压缩"方案（而非本节最初设想的"事后看穿一层压缩函数继续追踪"，后者被任务2 §8b.3 证明存在稠密PK场景下的静默错误结果风险，被否决）。修复后 Q9/Q10 的 3 个 `CONDITION_WRAPPED_BY_COMPRESSED_MATERIALIZATION` 归因项已清零，还原出的真实根因分别是：Q9 1个 → `PATH_INCOMPLETE_LEFT_SIDE`（条目8的目标，待条目8落地）；Q10 1个 → `FK_ON_BUILD_SIDE`（无解类）；Q10 1个 → 直接命中。**条目8的预期收益因此从"仅Q5 1个"上调为"Q5+Q9共2个"**。详见任务2文档 §8b.4.2/8b.4.3。
 
 ---
 
@@ -123,7 +123,7 @@ Q10,bitmap,3,1,...   -> 3个HASH_JOIN，命中1个
 - **executor 层收益是真实存在的**：几个命中 BHJ 的小/中型 join（`c_nationkey=n_nationkey`、`ps_suppkey=s_suppkey`）耗时相比 baseline 有数倍下降（Q10 的 `customer⋈nation` 从 12.5ms 降到 3.1ms，降幅 ~75%；Q9 的 `partsupp⋈supplier+nation` 从 127ms 降到 12ms，降幅 ~90%），说明位图查找确实比哈希探测快得多。
 - **但收益被两件事抵消了**：
   1. **命中率不够**——三条查询里耗时占比最大的几个 join（Q9/Q10 里动辄 200~1000+ms 的大 join）恰恰都是未命中的那几个，它们的耗时在 bitmap 模式下和 baseline 几乎没有差异（因为走的还是原来的普通 HashJoin 路径），三条查询的**总**耗时因此被这些未命中的大 join 主导，命中的小 join 省下来的几十毫秒相对总耗时（几百到上千毫秒）占比很小。
-  2. `Q5` 的 `orders⋈customer+nation+region` 这一条命中了 BHJ，但耗时反而从 baseline 48ms 涨到了 bitmap 模式 90ms（涨了近 2 倍）——这是一个需要额外关注的异常点，说明**并非所有命中 BHJ 的 join 都稳定获益**，具体原因待查（可能与该 join 的 build 侧行数、bitmap 大小、cache 命中率有关，需要另开一个执行器层面的诊断任务，不在本文档范围内展开）。
+  2. `Q5` 的 `orders⋈customer+nation+region` 这一条命中了 BHJ，但耗时反而从 baseline 48ms 涨到了 bitmap 模式 90ms（涨了近 2 倍）——这是一个需要额外关注的异常点，说明**并非所有命中 BHJ 的 join 都稳定获益**。**根因已在任务2条目8b验证过程中定位**（该条目新增命中的 Q10 `lineitem⋈orders` 复现了更极端的5倍暴涨，促使做了系统性排查）：`BitmapJoinExecutor` 的位图/payload 大小固定按 PK 表**静态全表行数**分配，不适应"build 侧被上游过滤器大幅收窄"的场景——密度（实际到达行数/静态总行数）越低，probe 端随机访问的 cache 命中率越差；Q5 这个 join 的 `customer` 密度约20.1%（`region='ASIA'` 过滤），恰好处于"收益打平"的区间，与 Q10 `orders` 密度3.8%（明显暴涨）、Q9 `supplier` 密度100%（明显获益）构成完整的密度梯度证据链。详见任务2文档 §8b.4.5。
 - **未命中的 join 没有额外 overhead**：对比未命中 join 在 bitmap 模式与 baseline 的耗时（如 Q10 的 `l_orderkey=o_orderkey` 226ms→221ms，Q5 的 `l_orderkey=o_orderkey` 141ms→147ms），差异都在测量噪声范围内，说明 `BitmapJoinResolver` 本身的规划期遍历/`ResolveOperatorTypes()` 重算没有引入可观察的额外开销。
 
 ### 7.5 总体结论（回答"瓶颈在计划层还是执行层"）
