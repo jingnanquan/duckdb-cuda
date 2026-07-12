@@ -3,6 +3,7 @@
 本文档给出从零开始（新机器/新 clone）复现本仓库全部 BHJ 相关测试所需的完整命令序列：编译 DuckDB → 生成 TPC-H SF=5 数据集 → 离线预处理（生成 `_rowid`/`*_ref` 列 + `bitmap_join_meta.json`）→ 编译测试 → 运行测试。
 
 > 本文档只覆盖 BHJ（Bitmap Hash Join）相关测试；不涉及项目里其它无关的测试套件。
+> 接下来我要在windows下构建
 
 ---
 
