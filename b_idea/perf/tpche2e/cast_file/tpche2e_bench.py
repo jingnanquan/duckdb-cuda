@@ -25,8 +25,8 @@ tpche2e_bench.py — TPC-H 22 条查询端到端 (e2e) 性能对比脚本
   python3 b_idea/perf/tpche2e/tpche2e_bench.py --bitmap-only
   # 指定官方 CLI 已有路径, 跳过下载
   python3 b_idea/perf/tpche2e/tpche2e_bench.py --official-cli /path/to/duckdb
-  # 指定其它 SF5 parquet 目录 / 线程数 / 版本
-  python3 b_idea/perf/tpche2e/tpche2e_bench.py --data-dir /other/sf5 --threads 8 --version 1.5.4
+  # 指定其它 SF5 parquet 目录 / 版本
+  python3 b_idea/perf/tpche2e/tpche2e_bench.py --data-dir /other/sf5 --version 1.5.4
 """
 
 import argparse
@@ -61,7 +61,6 @@ DUCKDB_VERSION = "1.5.1"
 OFFICIAL_URL_TPL = "https://github.com/duckdb/duckdb/releases/download/v{ver}/duckdb_cli-linux-amd64.zip"
 
 # 计时参数
-DEFAULT_THREADS = 4
 DEFAULT_RUNS = 3
 DEFAULT_WARMUP = 1
 DEFAULT_TIMEOUT = 600  # 单条查询超时 (秒)
@@ -116,7 +115,6 @@ def build_run_sql(data_dir, query_sql, use_bitmap):
     return (
         "SET autoinstall_known_extensions=false;\n"
         "SET autoload_known_extensions=false;\n"
-        f"PRAGMA threads={DEFAULT_THREADS};\n"
         f"{setup}\n"
         f"{flags}"
         f"{q};\n"
@@ -124,6 +122,11 @@ def build_run_sql(data_dir, query_sql, use_bitmap):
 
 
 def run_single(cli, sql, timeout):
+    """执行单条 SQL, 返回 (耗时秒, 错误信息|None)。
+
+    通过解析 DuckDB CLI 输出的 "Run Time (s):" 行获取引擎内部计时，
+    排除 Python 侧 subprocess 创建/调度开销。
+    """
     """执行单条 SQL, 返回 (耗时秒, 错误信息|None)。"""
     start = time.perf_counter()
     try:
@@ -364,13 +367,12 @@ def plot(results_rows):
 # 主流程
 # ============================================================
 def main():
-    global DEFAULT_THREADS, DEFAULT_RUNS, DEFAULT_WARMUP, DEFAULT_TIMEOUT, DATA_DIR, META_PATH
+    global DEFAULT_RUNS, DEFAULT_WARMUP, DEFAULT_TIMEOUT, DATA_DIR, META_PATH
     ap = argparse.ArgumentParser(description="TPC-H 22 e2e 性能对比: 官方 DuckDB 1.5.x vs 本项目 + open_bitmap_join")
     ap.add_argument("--data-dir", default=DATA_DIR, help="SF5 parquet 目录 (含 8 张表)")
     ap.add_argument("--project-cli", default=PROJECT_CLI, help="本项目构建的 duckdb CLI 路径")
     ap.add_argument("--official-cli", default=None, help="已下载的官方 duckdb CLI 路径 (指定后跳过下载)")
     ap.add_argument("--version", default=DUCKDB_VERSION, help="官方下载版本, 如 1.5.4")
-    ap.add_argument("--threads", type=int, default=DEFAULT_THREADS)
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
@@ -382,7 +384,6 @@ def main():
     ap.add_argument("--refresh-queries", action="store_true", help="强制重新从 tpch_queries() 提取查询文本")
     args = ap.parse_args()
 
-    DEFAULT_THREADS = args.threads  # pyright: ignore[reportConstantRedefinition]
     DEFAULT_RUNS = args.runs  # pyright: ignore[reportConstantRedefinition]
     DEFAULT_WARMUP = args.warmup  # pyright: ignore[reportConstantRedefinition]
     DEFAULT_TIMEOUT = args.timeout  # pyright: ignore[reportConstantRedefinition]

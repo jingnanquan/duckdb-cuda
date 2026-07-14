@@ -324,6 +324,13 @@ void BitmapJoinExecutor::CombineBitmap(BitmapJoinLocalState &lstate) {
 	//     记录 "哪些 word 被 touch 过"，但这本就是 local_data[w] 自身能直接回答的信息
 	//     (word 非 0 <=> 被 touch 过)，无需在 SinkBitmap 热路径里重复维护，这里直接读
 	//     local_data[w] 判断即可，效果完全等价且省掉了一份数组的分配/清零/写入开销。
+	// lock_guard<mutex> guard(build_lock);
+	// auto *global_data = global_bitmap.GetData();
+	// const idx_t word_count = ValidityMask::EntryCount(bitmap_size);
+	// for (idx_t w = 0; w < word_count; w++) {
+	// 	global_data[w] |= local_data[w];
+	// }
+
 	auto *global_data = global_bitmap.GetData();
 	auto *atomic_global = reinterpret_cast<std::atomic<validity_t> *>(global_data);
 	D_ASSERT(atomic_global);

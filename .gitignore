@@ -26,6 +26,8 @@
 *.sql
 .github/
 
+tpch_bench_harness
+
 *enter/
 .codebuddy/
 # a_idea/

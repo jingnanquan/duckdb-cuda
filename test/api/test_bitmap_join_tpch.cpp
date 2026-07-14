@@ -1,13 +1,17 @@
-// End-to-end TPC-H Q5/Q9/Q10 test for the Bitmap-Join (BHJ) execution path (design doc
+// End-to-end TPC-H test for the Bitmap-Join (BHJ) execution path (design doc
 // b_idea/6.4/6.4后续进展-实现与测试方案.md, 条目5).
 //
 // Unlike test_bitmap_join_perf.cpp (a single hand-picked equi-join) or test_bitmap_join_chain.cpp
-// (small synthetic multi-join chains), this test runs the *unmodified* standard TPC-H Q5/Q9/Q10
-// queries against the real SF=5 dataset in three modes:
+// (small synthetic multi-join chains), this test runs the *unmodified* standard TPC-H queries
+// against the real SF=5 dataset in three modes:
 //   1. baseline: open_perfect_join=false, open_bitmap_join=false (plain DuckDB hash join)
 //   2. perfect:  open_perfect_join=true,  open_bitmap_join=false (perfect-hash join)
 //   3. bitmap:   open_perfect_join=false, open_bitmap_join=true  (BHJ, fully automatic - no
 //      SetForceResolvedPK/SetForceBitmapJoin, exercising 条目1-4 end-to-end)
+//
+// Queries are fetched from TpchExtension (the `tpch` extension's dbgen-embedded query texts).
+// By default it runs Q5, Q9, Q10; override with the BHJ_QUERIES environment variable
+// (comma-separated list of query numbers, e.g. `BHJ_QUERIES=1,2,3`).
 //
 // For each (query, mode) it measures total wall-clock time and counts how many HASH_JOIN nodes
 // in the plan actually hit BHJ (via EXPLAIN's "Bitmap Join: yes" marker). Correctness (identical
@@ -22,6 +26,7 @@
 
 #include "catch.hpp"
 #include "test_helpers.hpp"
+#include "tpch_extension.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/bitmap_join_meta.hpp"
@@ -33,6 +38,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 
@@ -72,54 +78,36 @@ void CreateViews(Connection &con, const string &dir) {
 	}
 }
 
-// Standard TPC-H query templates (dbgen `:1`-style substitution parameters fixed to the values
-// from the official qgen defaults) - see http://www.tpc.org/tpch/ query template appendix.
-string Q5() {
-	return "SELECT n_name, sum(l_extendedprice * (1 - l_discount)) AS revenue "
-	       "FROM customer, orders, lineitem, supplier, nation, region "
-	       "WHERE c_custkey = o_custkey "
-	       "  AND l_orderkey = o_orderkey "
-	       "  AND l_suppkey = s_suppkey "
-	       "  AND c_nationkey = s_nationkey "
-	       "  AND s_nationkey = n_nationkey "
-	       "  AND n_regionkey = r_regionkey "
-	       "  AND r_name = 'ASIA' "
-	       "  AND o_orderdate >= DATE '1994-01-01' "
-	       "  AND o_orderdate < DATE '1994-01-01' + INTERVAL '1' YEAR "
-	       "GROUP BY n_name "
-	       "ORDER BY revenue DESC";
-}
-
-string Q9() {
-	return "SELECT nation, o_year, sum(amount) AS sum_profit FROM ("
-	       "  SELECT n_name AS nation, extract(year FROM o_orderdate) AS o_year, "
-	       "         l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount "
-	       "  FROM part, supplier, lineitem, partsupp, orders, nation "
-	       "  WHERE s_suppkey = l_suppkey "
-	       "    AND ps_suppkey = l_suppkey "
-	       "    AND ps_partkey = l_partkey "
-	       "    AND p_partkey = l_partkey "
-	       "    AND o_orderkey = l_orderkey "
-	       "    AND s_nationkey = n_nationkey "
-	       "    AND p_name LIKE '%green%'"
-	       ") AS profit "
-	       "GROUP BY nation, o_year "
-	       "ORDER BY nation, o_year DESC";
-}
-
-string Q10() {
-	return "SELECT c_custkey, c_name, sum(l_extendedprice * (1 - l_discount)) AS revenue, "
-	       "       c_acctbal, n_name, c_address, c_phone, c_comment "
-	       "FROM customer, orders, lineitem, nation "
-	       "WHERE c_custkey = o_custkey "
-	       "  AND l_orderkey = o_orderkey "
-	       "  AND o_orderdate >= DATE '1993-10-01' "
-	       "  AND o_orderdate < DATE '1993-10-01' + INTERVAL '3' MONTH "
-	       "  AND l_returnflag = 'R' "
-	       "  AND c_nationkey = n_nationkey "
-	       "GROUP BY c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment "
-	       "ORDER BY revenue DESC "
-	       "LIMIT 20";
+//! Returns the list of TPC-H query numbers to run.  Defaults to {5, 9, 10}.
+//! Override via the BHJ_QUERIES environment variable (comma-separated, e.g. "1,2,3").
+std::vector<int> GetQueryIds() {
+	std::vector<int> defaults = {5, 9, 10};
+	const char *env = std::getenv("BHJ_QUERIES");
+	if (!env || strlen(env) == 0) {
+		return defaults;
+	}
+	std::vector<int> ids;
+	string token;
+	for (const char *p = env; *p; p++) {
+		char c = *p;
+		if (c == ',') {
+			if (!token.empty()) {
+				ids.push_back(std::stoi(token));
+				token.clear();
+			}
+		} else if (c != ' ') {
+			token += c;
+		}
+	}
+	if (!token.empty()) {
+		ids.push_back(std::stoi(token));
+	}
+	if (ids.empty()) {
+		return defaults;
+	}
+	std::sort(ids.begin(), ids.end());
+	ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+	return ids;
 }
 
 struct QuerySpec {
@@ -132,18 +120,24 @@ struct QuerySpec {
 	idx_t expected_bhj_hits;
 };
 
-duckdb::vector<QuerySpec> AllQueries() {
-	// Q5: customer-orders, orders-lineitem, lineitem-supplier, customer/supplier-nation (via a
-	// derived equality, may or may not get picked up depending on join-graph shape),
-	// nation-region: up to 5 single-equality candidates.
-	// Q9: partsupp-lineitem is a *2-column* join (ps_partkey=l_partkey AND ps_suppkey=l_suppkey)
-	// -> not eligible; part-lineitem, supplier-lineitem, orders-lineitem, supplier-nation remain.
-	// Q10: customer-orders, orders-lineitem, customer-nation: up to 3.
-	return {
-	    {"Q5", Q5(), 3},
-	    {"Q9", Q9(), 2},
-	    {"Q10", Q10(), 2},
-	};
+// Some queries have hand-counted expected_bhj_hits for soft diagnostics.
+static idx_t KnownExpectedBHJHits(int q) {
+	// clang-format off
+	switch (q) {
+	case 5:  return 3;
+	case 9:  return 2;
+	case 10: return 2;
+	default: return 0;
+	}
+	// clang-format on
+}
+
+duckdb::vector<QuerySpec> GetQueries(const std::vector<int> &query_ids) {
+	duckdb::vector<QuerySpec> result;
+	for (int q : query_ids) {
+		result.push_back({string("Q") + std::to_string(q), TpchExtension::GetQuery(q), KnownExpectedBHJHits(q)});
+	}
+	return result;
 }
 
 //! Renders EXPLAIN output as a single string so it can be grepped for plan markers.
@@ -277,7 +271,7 @@ void WriteCsvRow(std::ofstream &csv, const string &query, const string &mode, id
 
 } // namespace
 
-TEST_CASE("Bitmap-Join (BHJ) end-to-end TPC-H Q5/Q9/Q10 (SF=5 parquet)", "[bitmap_join_tpch][.]") {
+TEST_CASE("Bitmap-Join (BHJ) end-to-end TPC-H queries (SF=5 parquet)", "[bitmap_join_tpch][.]") {
 	if (!DatasetAvailable(kBitmapDataDir)) {
 		std::cerr << "[bitmap-join-tpch] dataset directory '" << kBitmapDataDir << "' not found/incomplete - "
 		          << "skipping test." << std::endl;
@@ -303,6 +297,18 @@ TEST_CASE("Bitmap-Join (BHJ) end-to-end TPC-H Q5/Q9/Q10 (SF=5 parquet)", "[bitma
 	registry.SetForceResolvedPK("", "");
 	registry.LoadFromJson(meta_path);
 
+	auto query_ids = GetQueryIds();
+	auto specs = GetQueries(query_ids);
+
+	printf("Running TPC-H queries: ");
+	for (size_t i = 0; i < query_ids.size(); i++) {
+		if (i) {
+			printf(", ");
+		}
+		printf("Q%d", query_ids[i]);
+	}
+	printf("\n");
+
 	std::ofstream csv;
 	{
 		auto fs = FileSystem::CreateLocal();
@@ -315,7 +321,7 @@ TEST_CASE("Bitmap-Join (BHJ) end-to-end TPC-H Q5/Q9/Q10 (SF=5 parquet)", "[bitma
 	printf("\n%-6s %-10s %10s %10s %10s %8s %8s %10s\n", "Query", "Mode", "Cold(ms)", "WarmAvg", "WarmMin", "#HJ", "#BHJ", "Rows");
 	printf("------------------------------------------------------------------------\n");
 
-	for (auto &spec : AllQueries()) {
+	for (auto &spec : specs) {
 		auto baseline = RunQuery(con, spec.sql, /*open_perfect=*/false, /*open_bitmap=*/false);
 		auto perfect = RunQuery(con, spec.sql, /*open_perfect=*/true, /*open_bitmap=*/false);
 		auto bitmap = RunQuery(con, spec.sql, /*open_perfect=*/false, /*open_bitmap=*/true);
@@ -371,7 +377,7 @@ TEST_CASE("Bitmap-Join (BHJ) end-to-end TPC-H Q5/Q9/Q10 (SF=5 parquet)", "[bitma
 // (data/tpch_sf5, no `_rowid`/`*_ref` columns, no VIEWs/registry involved at all) - the strongest
 // available anchor that add_bitmap_columns.py's preprocessing didn't itself corrupt any data
 // (design doc §5.3 point 5).
-TEST_CASE("Bitmap-Join (BHJ) TPC-H Q5/Q9/Q10 cross-validation against the raw (non-bitmap) SF=5 dataset",
+TEST_CASE("Bitmap-Join (BHJ) TPC-H queries cross-validation against the raw (non-bitmap) SF=5 dataset",
           "[bitmap_join_tpch][.]") {
 	if (!DatasetAvailable(kBitmapDataDir) || !DatasetAvailable(kRawDataDir)) {
 		std::cerr << "[bitmap-join-tpch] one of the two SF=5 dataset directories is missing/incomplete - "
@@ -389,7 +395,8 @@ TEST_CASE("Bitmap-Join (BHJ) TPC-H Q5/Q9/Q10 cross-validation against the raw (n
 	Connection raw_con(raw_db);
 	CreateViews(raw_con, kRawDataDir);
 
-	for (auto &spec : AllQueries()) {
+	auto specs = GetQueries(GetQueryIds());
+	for (auto &spec : specs) {
 		auto bitmap_result = bitmap_con.Query(spec.sql);
 		REQUIRE_NO_FAIL(*bitmap_result);
 		auto raw_result = raw_con.Query(spec.sql);

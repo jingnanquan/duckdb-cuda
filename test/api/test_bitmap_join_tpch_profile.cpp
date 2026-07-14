@@ -4,9 +4,11 @@
 // Unlike test_bitmap_join_tpch.cpp (which only measures *query-level* wall-clock time and a
 // "how many joins hit BHJ" count), this test drills down to *each individual HASH_JOIN node's*
 // own operator_timing (via `PRAGMA enable_profiling='json'`) across all three modes
-// (baseline / perfect / bitmap), for Q5/Q9/Q10. The goal is to answer: is the underwhelming
-// end-to-end speedup a *planning* problem (hit-rate too low) or an *executor* problem (a join
-// hits BHJ but doesn't actually get faster)?
+// (baseline / perfect / bitmap).
+//
+// Queries are fetched from TpchExtension (the `tpch` extension's dbgen-embedded query texts).
+// By default it runs Q5, Q9, Q10; override with the BHJ_QUERIES environment variable
+// (comma-separated list of query numbers, e.g. `BHJ_QUERIES=1,2,3`).
 //
 // Results are written to b_idea/perf/sf5/tpch_operator_timing.csv (one row per HASH_JOIN node
 // per mode) for the attribution table in the design doc. Hidden behind `[.]` like the other
@@ -14,6 +16,7 @@
 
 #include "catch.hpp"
 #include "test_helpers.hpp"
+#include "tpch_extension.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/bitmap_join_meta.hpp"
@@ -24,6 +27,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -60,55 +64,36 @@ void CreateViews(Connection &con, const string &dir) {
 	}
 }
 
-// Same 3 query texts as test_bitmap_join_tpch.cpp (kept independent/duplicated on purpose - this
-// file's purpose, per design doc 条目7, is standalone operator-timing diagnostics and shouldn't
-// need to pull in that file's helper structs).
-string Q5() {
-	return "SELECT n_name, sum(l_extendedprice * (1 - l_discount)) AS revenue "
-	       "FROM customer, orders, lineitem, supplier, nation, region "
-	       "WHERE c_custkey = o_custkey "
-	       "  AND l_orderkey = o_orderkey "
-	       "  AND l_suppkey = s_suppkey "
-	       "  AND c_nationkey = s_nationkey "
-	       "  AND s_nationkey = n_nationkey "
-	       "  AND n_regionkey = r_regionkey "
-	       "  AND r_name = 'ASIA' "
-	       "  AND o_orderdate >= DATE '1994-01-01' "
-	       "  AND o_orderdate < DATE '1994-01-01' + INTERVAL '1' YEAR "
-	       "GROUP BY n_name "
-	       "ORDER BY revenue DESC";
-}
-
-string Q9() {
-	return "SELECT nation, o_year, sum(amount) AS sum_profit FROM ("
-	       "  SELECT n_name AS nation, extract(year FROM o_orderdate) AS o_year, "
-	       "         l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount "
-	       "  FROM part, supplier, lineitem, partsupp, orders, nation "
-	       "  WHERE s_suppkey = l_suppkey "
-	       "    AND ps_suppkey = l_suppkey "
-	       "    AND ps_partkey = l_partkey "
-	       "    AND p_partkey = l_partkey "
-	       "    AND o_orderkey = l_orderkey "
-	       "    AND s_nationkey = n_nationkey "
-	       "    AND p_name LIKE '%green%'"
-	       ") AS profit "
-	       "GROUP BY nation, o_year "
-	       "ORDER BY nation, o_year DESC";
-}
-
-string Q10() {
-	return "SELECT c_custkey, c_name, sum(l_extendedprice * (1 - l_discount)) AS revenue, "
-	       "       c_acctbal, n_name, c_address, c_phone, c_comment "
-	       "FROM customer, orders, lineitem, nation "
-	       "WHERE c_custkey = o_custkey "
-	       "  AND l_orderkey = o_orderkey "
-	       "  AND o_orderdate >= DATE '1993-10-01' "
-	       "  AND o_orderdate < DATE '1993-10-01' + INTERVAL '3' MONTH "
-	       "  AND l_returnflag = 'R' "
-	       "  AND c_nationkey = n_nationkey "
-	       "GROUP BY c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment "
-	       "ORDER BY revenue DESC "
-	       "LIMIT 20";
+//! Returns the list of TPC-H query numbers to run.  Defaults to {5, 9, 10}.
+//! Override via the BHJ_QUERIES environment variable (comma-separated, e.g. "1,2,3").
+std::vector<int> GetQueryIds() {
+	std::vector<int> defaults = {5, 9, 10};
+	const char *env = std::getenv("BHJ_QUERIES");
+	if (!env || strlen(env) == 0) {
+		return defaults;
+	}
+	std::vector<int> ids;
+	string token;
+	for (const char *p = env; *p; p++) {
+		char c = *p;
+		if (c == ',') {
+			if (!token.empty()) {
+				ids.push_back(std::stoi(token));
+				token.clear();
+			}
+		} else if (c != ' ') {
+			token += c;
+		}
+	}
+	if (!token.empty()) {
+		ids.push_back(std::stoi(token));
+	}
+	if (ids.empty()) {
+		return defaults;
+	}
+	std::sort(ids.begin(), ids.end());
+	ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+	return ids;
 }
 
 string SafeStr(yyjson_val *v) {
@@ -291,7 +276,7 @@ void RunAndReport(Connection &con, const string &name, const string &sql, std::o
 
 } // namespace
 
-TEST_CASE("BHJ operator-level timing across baseline/perfect/bitmap for TPC-H Q5/Q9/Q10 (SF=5)",
+TEST_CASE("BHJ operator-level timing across baseline/perfect/bitmap for TPC-H queries (SF=5)",
           "[bitmap_join_tpch_profile][.]") {
 	if (!DatasetAvailable(kBitmapDataDir)) {
 		std::cerr << "[bitmap-join-tpch-profile] dataset directory '" << kBitmapDataDir
@@ -324,9 +309,21 @@ TEST_CASE("BHJ operator-level timing across baseline/perfect/bitmap for TPC-H Q5
 	std::ofstream csv(csv_dir + "/tpch_operator_timing.csv", std::ios::out | std::ios::trunc);
 	csv << "query,join_label,baseline_ms,perfect_ms,bitmap_ms,bitmap_join_status\n";
 
-	RunAndReport(con, "Q5", Q5(), csv, "/tmp");
-	RunAndReport(con, "Q9", Q9(), csv, "/tmp");
-	RunAndReport(con, "Q10", Q10(), csv, "/tmp");
+	auto query_ids = GetQueryIds();
+	printf("Running TPC-H queries: ");
+	for (size_t i = 0; i < query_ids.size(); i++) {
+		if (i) {
+			printf(", ");
+		}
+		printf("Q%d", query_ids[i]);
+	}
+	printf("\n");
+
+	for (int q : query_ids) {
+		string name = "Q" + std::to_string(q);
+		string sql = TpchExtension::GetQuery(q);
+		RunAndReport(con, name, sql, csv, "/tmp");
+	}
 
 	printf("\nCSV written to b_idea/perf/sf5/tpch_operator_timing.csv\n");
 	registry.Clear();
