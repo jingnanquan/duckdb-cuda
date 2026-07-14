@@ -43,6 +43,8 @@ string BitmapJoinSkipReasonToString(BitmapJoinSkipReason reason) {
 		return "path_incomplete_left_side";
 	case BitmapJoinSkipReason::PATH_INCOMPLETE_OTHER:
 		return "path_incomplete_other";
+	case BitmapJoinSkipReason::LOW_DENSITY:
+		return "low_density";
 	default:
 		return "unknown";
 	}

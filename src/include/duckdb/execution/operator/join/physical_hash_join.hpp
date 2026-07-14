@@ -75,6 +75,16 @@ public:
 	//! by ParamsToString for EXPLAIN output; never affects execution.
 	BitmapJoinSkipReason bhj_skip_reason = BitmapJoinSkipReason::NOT_PROCESSED;
 
+	//! 条目8 (b_idea/6.4遗漏问题 任务2): indices into the probe (LHS) input chunk for columns
+	//! that must be passed through to this join's output AFTER the normal [lhs_output]
+	//! [rhs_output] columns. Populated from LogicalComparisonJoin::bhj_passthrough_refs (already
+	//! resolved to BoundReferenceExpression by ColumnBindingResolver) when the physical plan is
+	//! created. Each index is the position of a hidden column (_rowid/*_ref) in the LHS child's
+	//! output that was injected by BitmapJoinResolver::PropagateHiddenColumn. The execution
+	//! paths (both regular HashJoin and BHJ) append these columns to the output chunk after
+	//! the normal [lhs][rhs] columns. Empty (zero effect) in the common case.
+	vector<idx_t> passthrough_lhs_col_idxs;
+
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 

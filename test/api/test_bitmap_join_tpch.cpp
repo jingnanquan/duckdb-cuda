@@ -29,6 +29,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/query_result.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -186,11 +187,22 @@ idx_t CountHashJoins(const string &explain_text) {
 }
 
 struct RunOutcome {
-	double elapsed_ms = 0.0;
+	double cold_ms = 0.0;      //! First run (cold: includes parquet metadata load, plan construction, BHJ executor allocation)
+	double warm_avg_ms = 0.0;  //! Average of 3 subsequent warm runs (OS file cache hot, plan cached)
+	double warm_min_ms = 0.0;  //! Best warm run (min noise)
+	double warm_max_ms = 0.0;  //! Worst warm run (max noise)
 	idx_t bhj_hits = 0;
 	idx_t hash_join_count = 0;
 	duckdb::unique_ptr<MaterializedQueryResult> result;
 };
+
+static double TimedQuery(Connection &con, const string &sql) {
+	auto start = std::chrono::steady_clock::now();
+	auto result = con.Query(sql);
+	auto end = std::chrono::steady_clock::now();
+	REQUIRE_NO_FAIL(*result);
+	return std::chrono::duration<double, std::milli>(end - start).count();
+}
 
 RunOutcome RunQuery(Connection &con, const string &sql, bool open_perfect, bool open_bitmap) {
 	REQUIRE_NO_FAIL(*con.Query(string("SET open_perfect_join=") + (open_perfect ? "true" : "false")));
@@ -201,15 +213,22 @@ RunOutcome RunQuery(Connection &con, const string &sql, bool open_perfect, bool 
 	out.bhj_hits = CountBitmapJoinHits(plan);
 	out.hash_join_count = CountHashJoins(plan);
 
-	// Warm up (parquet metadata / OS file cache) before timing.
-	auto warmup = con.Query(sql);
-	REQUIRE_NO_FAIL(*warmup);
+	// Cold run: first execution - includes parquet metadata load, plan optimization,
+	// BitmapJoinExecutor construction (bitmap + payload_columns allocation), etc.
+	out.cold_ms = TimedQuery(con, sql);
 
-	auto start = std::chrono::steady_clock::now();
+	// Warm runs: 3 subsequent executions with OS file cache hot and plan cached.
+	double warm_times[3];
+	for (int i = 0; i < 3; i++) {
+		warm_times[i] = TimedQuery(con, sql);
+	}
+	out.warm_min_ms = std::min({warm_times[0], warm_times[1], warm_times[2]});
+	out.warm_max_ms = std::max({warm_times[0], warm_times[1], warm_times[2]});
+	out.warm_avg_ms = (warm_times[0] + warm_times[1] + warm_times[2]) / 3.0;
+
+	// Keep the last result for correctness comparison.
 	auto result = con.Query(sql);
-	auto end = std::chrono::steady_clock::now();
 	REQUIRE_NO_FAIL(*result);
-	out.elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
 	out.result = duckdb::unique_ptr<MaterializedQueryResult>(static_cast<MaterializedQueryResult *>(result.release()));
 	return out;
 }
@@ -251,9 +270,9 @@ void RequireResultsMatch(const string &label_a, MaterializedQueryResult &a, cons
 }
 
 void WriteCsvRow(std::ofstream &csv, const string &query, const string &mode, idx_t hash_join_count, idx_t bhj_hits,
-                 idx_t rows_out, double time_ms) {
-	csv << query << "," << mode << "," << hash_join_count << "," << bhj_hits << "," << rows_out << "," << time_ms
-	    << "\n";
+                 idx_t rows_out, double cold_ms, double warm_avg_ms, double warm_min_ms, double warm_max_ms) {
+	csv << query << "," << mode << "," << hash_join_count << "," << bhj_hits << "," << rows_out << ","
+	    << cold_ms << "," << warm_avg_ms << "," << warm_min_ms << "," << warm_max_ms << "\n";
 }
 
 } // namespace
@@ -290,33 +309,36 @@ TEST_CASE("Bitmap-Join (BHJ) end-to-end TPC-H Q5/Q9/Q10 (SF=5 parquet)", "[bitma
 		const string csv_dir = "/data/workspace/database/duckdb-cuda/b_idea/perf/sf5";
 		fs->CreateDirectoriesRecursive(csv_dir);
 		csv.open(csv_dir + "/tpch_q5_q9_q10.csv", std::ios::out | std::ios::trunc);
-		csv << "query,mode,hash_join_count,bhj_hits,rows_out,time_ms\n";
+		csv << "query,mode,hash_join_count,bhj_hits,rows_out,cold_ms,warm_avg_ms,warm_min_ms,warm_max_ms\n";
 	}
 
-	printf("\n%-6s %-10s %10s %8s %8s %10s\n", "Query", "Mode", "Time(ms)", "#HJ", "#BHJ", "Rows");
-	printf("--------------------------------------------------------------\n");
+	printf("\n%-6s %-10s %10s %10s %10s %8s %8s %10s\n", "Query", "Mode", "Cold(ms)", "WarmAvg", "WarmMin", "#HJ", "#BHJ", "Rows");
+	printf("------------------------------------------------------------------------\n");
 
 	for (auto &spec : AllQueries()) {
 		auto baseline = RunQuery(con, spec.sql, /*open_perfect=*/false, /*open_bitmap=*/false);
 		auto perfect = RunQuery(con, spec.sql, /*open_perfect=*/true, /*open_bitmap=*/false);
 		auto bitmap = RunQuery(con, spec.sql, /*open_perfect=*/false, /*open_bitmap=*/true);
 
-		printf("%-6s %-10s %10.1f %8llu %8llu %10llu\n", spec.name.c_str(), "baseline", baseline.elapsed_ms,
+		printf("%-6s %-10s %10.1f %10.1f %10.1f %8llu %8llu %10llu\n", spec.name.c_str(), "baseline",
+		       baseline.cold_ms, baseline.warm_avg_ms, baseline.warm_min_ms,
 		       (unsigned long long)baseline.hash_join_count, (unsigned long long)baseline.bhj_hits,
 		       (unsigned long long)baseline.result->RowCount());
-		printf("%-6s %-10s %10.1f %8llu %8llu %10llu\n", spec.name.c_str(), "perfect", perfect.elapsed_ms,
+		printf("%-6s %-10s %10.1f %10.1f %10.1f %8llu %8llu %10llu\n", spec.name.c_str(), "perfect",
+		       perfect.cold_ms, perfect.warm_avg_ms, perfect.warm_min_ms,
 		       (unsigned long long)perfect.hash_join_count, (unsigned long long)perfect.bhj_hits,
 		       (unsigned long long)perfect.result->RowCount());
-		printf("%-6s %-10s %10.1f %8llu %8llu %10llu\n", spec.name.c_str(), "bitmap", bitmap.elapsed_ms,
+		printf("%-6s %-10s %10.1f %10.1f %10.1f %8llu %8llu %10llu\n", spec.name.c_str(), "bitmap",
+		       bitmap.cold_ms, bitmap.warm_avg_ms, bitmap.warm_min_ms,
 		       (unsigned long long)bitmap.hash_join_count, (unsigned long long)bitmap.bhj_hits,
 		       (unsigned long long)bitmap.result->RowCount());
 
 		WriteCsvRow(csv, spec.name, "baseline", baseline.hash_join_count, baseline.bhj_hits,
-		           baseline.result->RowCount(), baseline.elapsed_ms);
+		           baseline.result->RowCount(), baseline.cold_ms, baseline.warm_avg_ms, baseline.warm_min_ms, baseline.warm_max_ms);
 		WriteCsvRow(csv, spec.name, "perfect", perfect.hash_join_count, perfect.bhj_hits,
-		           perfect.result->RowCount(), perfect.elapsed_ms);
-		WriteCsvRow(csv, spec.name, "bitmap", bitmap.hash_join_count, bitmap.bhj_hits, bitmap.result->RowCount(),
-		           bitmap.elapsed_ms);
+		           perfect.result->RowCount(), perfect.cold_ms, perfect.warm_avg_ms, perfect.warm_min_ms, perfect.warm_max_ms);
+		WriteCsvRow(csv, spec.name, "bitmap", bitmap.hash_join_count, bitmap.bhj_hits,
+		           bitmap.result->RowCount(), bitmap.cold_ms, bitmap.warm_avg_ms, bitmap.warm_min_ms, bitmap.warm_max_ms);
 
 		// --- 1. Correctness (hard requirement) ---
 		RequireResultsMatch(spec.name + "/baseline", *baseline.result, spec.name + "/perfect", *perfect.result);
@@ -331,9 +353,10 @@ TEST_CASE("Bitmap-Join (BHJ) end-to-end TPC-H Q5/Q9/Q10 (SF=5 parquet)", "[bitma
 		}
 
 		// --- 3. Performance (soft diagnostic only) ---
-		if (baseline.elapsed_ms > 0 && bitmap.elapsed_ms > baseline.elapsed_ms * 1.2) {
-			std::cerr << "[bitmap-join-tpch] WARNING: " << spec.name << " bitmap mode (" << bitmap.elapsed_ms
-			          << " ms) is >20% slower than baseline (" << baseline.elapsed_ms << " ms)." << std::endl;
+		if (baseline.warm_avg_ms > 0 && bitmap.warm_avg_ms > baseline.warm_avg_ms * 1.2) {
+			std::cerr << "[bitmap-join-tpch] WARNING: " << spec.name << " bitmap mode (warm_avg=" << bitmap.warm_avg_ms
+			          << " ms, cold=" << bitmap.cold_ms << " ms) is >20% slower than baseline (warm_avg="
+			          << baseline.warm_avg_ms << " ms, cold=" << baseline.cold_ms << " ms)." << std::endl;
 		}
 	}
 

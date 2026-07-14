@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/validity_mask.hpp"
@@ -37,6 +38,13 @@ struct BitmapJoinLocalState {
 	//! all-invalid mask sized to the PK table row count; bit i == 1 means build row i passed.
 	ValidityMask bitmap;
 	bool initialized = false;
+
+	//! perf/sf5/combine锁 优化: 本线程累计的有效 build 行数 (跨该线程处理过的所有 chunk 累加)。
+	//! CombineBitmap 时汇总到 BitmapJoinExecutor::total_valid_count，用来在 FinalizeBitmap 里
+	//! 以 O(线程数) 的求和替代对 global_bitmap 的一次全量 CountValid 扫描 (见 §5.1 稠密判定)。
+	//! 依赖 BHJ 的前提: build 侧是 PK(唯一)侧, 同一 rowid 不会被置位两次, 故
+	//! sum(valid_count) == bitmap_size <=> popcount(global_bitmap) == bitmap_size。
+	idx_t valid_count = 0;
 };
 
 //! Global Bitmap-Join executor, owned by HashJoinGlobalSinkState. Holds the merged
@@ -91,9 +99,24 @@ private:
 	//! For each RHS output column i, the source column index within the build chunk.
 	vector<idx_t> payload_source_columns;
 
+	//! 条目8: payload 列按物理类型分流。定长列 scatter 写不同 rowid 位置，lock-free 安全；
+	//! 变长列(VARCHAR) scatter 需操作 StringHeap，必须加锁。分流后定长列不被 varchar 锁阻塞。
+	vector<idx_t> fixed_payload_indices;
+	vector<idx_t> var_payload_indices;
+
 	//! Guards global_bitmap OR-merge and payload scatter (build side is the small side).
 	mutex build_lock;
 	bool ready = false;
+	//! 5.1 (perf/sf5/combine锁 / 根因分析-详细版.md §5.1): 稠密 fast-path 标志。
+	//! FinalizeBitmap 时若 bitmap 全部置位 (popcount == bitmap_size) 则置 true，
+	//! probe 据此跳过逐行位测试（与 perfect hash join 稠密 fast-path 对称）。
+	bool is_build_dense = false;
+	//! perf/sf5/combine锁 优化 (§建议2): 各线程 BitmapJoinLocalState::valid_count 之和，
+	//! 由 CombineBitmap 原子累加。BHJ 的前提是 build 侧为 PK(唯一)侧，故同一 rowid 不会被
+	//! 两个线程重复置位，sum(valid_count) == bitmap_size 等价于 popcount(global_bitmap) ==
+	//! bitmap_size；FinalizeBitmap 据此以 O(线程数) 的读取替代对 global_bitmap 的一次全量
+	//! CountValid 扫描 (O(bitmap_size/64))。
+	std::atomic<idx_t> total_valid_count {0};
 };
 
 } // namespace duckdb

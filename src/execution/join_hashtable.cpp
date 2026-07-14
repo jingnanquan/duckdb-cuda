@@ -992,7 +992,8 @@ void ScanStructure::UpdateCompactionBuffer(idx_t base_count, SelectionVector &re
 
 void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &left, DataChunk &result) {
 	if (ht.join_type != JoinType::RIGHT_SEMI && ht.join_type != JoinType::RIGHT_ANTI) {
-		D_ASSERT(result.ColumnCount() == left.ColumnCount() + ht.output_columns.size());
+		// 条目8 (b_idea/6.4遗漏问题 任务2): allow extra columns for BHJ passthrough refs.
+		D_ASSERT(result.ColumnCount() >= left.ColumnCount() + ht.output_columns.size());
 	}
 
 	idx_t base_count = 0;

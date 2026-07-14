@@ -13,6 +13,17 @@ PerfectHashJoinExecutor::PerfectHashJoinExecutor(const PhysicalHashJoin &join_p,
 // Initialize
 //===--------------------------------------------------------------------===//
 bool ExtractNumericValue(Value val, hugeint_t &result) {
+	if (val.IsNull()) {
+		// A NULL build-range bound cannot describe a usable perfect-hash domain. Signal
+		// "cannot convert" so the caller (PerfectHashJoinExecutor::CanDoPerfectHashJoin)
+		// gracefully declines the perfect-hash optimization and falls back to a regular
+		// hash join instead of dereferencing the NULL Value via GetValueInternal (which
+		// throws "Calling GetValueInternal on a value that is NULL"). This path is hit
+		// when a dynamic (pushed-down) min/max filter aggregate over the build column is
+		// NULL (e.g. under open_bitmap_join=true, which changes the plan enough that the
+		// regular hash-join's filter-pushdown produces a NULL bound).
+		return false;
+	}
 	if (!val.type().IsIntegral()) {
 		switch (val.type().InternalType()) {
 		case PhysicalType::INT8:

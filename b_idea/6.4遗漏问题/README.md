@@ -26,7 +26,7 @@ related:
 拆分理由：1、2 都是"不改变生产代码逻辑的诊断工作"（顶多加一个默认关闭的诊断标注），产出是分析报告和数据表，用来回答"3 是否值得投入"；3、4 都是"真实的代码改动 + 回归测试"，且 3 的实现方案设计依赖对现有约束（`RemoveUnusedColumns` 产生的绝对位置引用）的深入分析，篇幅和复杂度都明显大于诊断类工作，单独成文。
 
 - 详见 [任务1-BHJ命中率归因与算子耗时画像.md](./任务1-BHJ命中率归因与算子耗时画像.md)（**已完成**：归因表+耗时表均已用真实 SF5 数据填充，并在此过程中意外发现并修复了一个真实的 `RIGHT_SEMI` 崩溃 bug——TPCH Q20）
-- 详见 [任务2-中间Join左侧传播优化与RIGHT_SEMI覆盖.md](./任务2-中间Join左侧传播优化与RIGHT_SEMI覆盖.md)（**条目8b 已实施并通过真实SF5数据验证**；条目9/RIGHT_SEMI定案不做；条目8/LEFT侧传播待排期）
+- 详见 [任务2-中间Join左侧传播优化与RIGHT_SEMI覆盖.md](./任务2-中间Join左侧传播优化与RIGHT_SEMI覆盖.md)（**条目8b+条目8 均已实施并通过真实SF5数据验证**；条目9/RIGHT_SEMI定案不做）
 
 ## 任务1 核心结论速览（详见任务1文档）
 
@@ -43,7 +43,15 @@ related:
 
 方案实际比最初设计更复杂：`CompressedMaterialization` 自下而上逐节点压缩，某列在下层可能只是"payload列"被压缩，但它是上层某个祖先join的字面条件——最初"只保护当前join自己条件列"的设计不足以覆盖这种跨层情况，最终采用"全局预扫描（跑一次，收集全树所有INNER单等值join的条件绑定）+ 所有4个Compress*函数统一按此名单排除"的方案，详见任务2文档 §8b.4。
 
-## 建议执行顺序（v0.4.0 更新）
+## 任务2 条目8 核心结论速览（详见任务2文档 §8.7）
+
+条目8（LEFT侧传播优化）已实施并验证通过——采用 `bhj_passthrough_refs` 方案（完整 Step A-E），在 `LogicalComparisonJoin` 上新增旁路列字段，将隐藏列追加在 join 输出的物理最末尾 `[left][right][passthrough]`，避免 shift 任何已有位置。改动覆盖逻辑层（`GetColumnBindings`/`ResolveTypes` override、`TraceBindingToGet`/`PropagateHiddenColumn` LEFT侧处理、`ColumnBindingResolver` passthrough解析）和物理执行层（三处执行路径：常规HashJoin、perfect hash join、BHJ ProbeBitmap 均追加 passthrough 列）。
+
+- Q5 命中率 3/5 → **4/5**，Q9 命中率 3/5 → **4/5**，`PATH_INCOMPLETE_LEFT_SIDE` 归因清零。
+- Q9 总耗时降幅 **19%**（341→278ms），新增命中的 `l_orderkey=o_orderkey` join 从 1101ms 降至 563ms。
+- Q5 出现中等额外开销（§8b.4.5 预警的"低密度=性能下降"场景在 Q5 上真实复现）：新增命中的 `l_orderkey=o_orderkey` join 走 BHJ 后，wall-clock 从 158ms 增至 266ms（1.68x）。**此前记录的"暴涨13.5倍"系 `operator_timing` 测量偏差**（含 pipeline 等待阻塞，详见任务2文档 §8.7.2a）。实际开销来自 `payload_columns`（114MB，密度3%）的稀疏 gather，bitmap 本身 916KB 可放 L2 不是瓶颈。
+
+## 建议执行顺序（v0.8.0 更新）
 
 ```text
 任务1（诊断，已完成）
@@ -52,10 +60,13 @@ related:
                                   ▼
                      结论：CompressedMaterialization冲突（条目8b）优先级 > LEFT侧限制（条目8）
                                   │
-任务2
+任务2（实现，全部完成）
   ├─ 条目8b：CompressedMaterialization 源头过滤 —— 已实施并验证通过 ✓
-  ├─ 条目8：中间 join LEFT 侧传播优化（待排期；预期收益已上调为 Q5+Q9 共2个join，见上）
+  ├─ 条目8：中间 join LEFT 侧传播优化（bhj_passthrough_refs方案）—— 已实施并验证通过 ✓
+  │   Q5 命中率 3/5→4/5，Q9 命中率 3/5→4/5，PATH_INCOMPLETE_LEFT_SIDE 归因清零
+  │   Q9 总耗时降幅22%（338→262ms）；Q5 wall-clock 增53%（157→240ms，低密度join开销）
+  │   Q10 仅慢1%（222→225ms）← payload scatter锁优化+CombineBitmap无锁稀疏合并后消除>20%告警
   └─ 条目9：RIGHT_SEMI —— 已决策不做（Q5/Q9/Q10均为INNER join，无真实场景驱动）
 ```
 
-另需关注（新发现，独立于本任务范围）：命中BHJ后反而变慢的执行器异常已出现2例（Q5 ~2倍、Q10 ~5倍），**根因已定位**——`BitmapJoinExecutor` 的位图/payload 大小固定按 `bitmap_join_meta.json` 里登记的 PK 表**静态全表行数**分配，不适应"build 侧被上游过滤器大幅收窄"的场景；密度（实际到达行数/静态总行数）与耗时变化强相关：密度100%稳定获益（降幅68%~91%）、密度~20%基本持平、密度3.8%暴涨5倍。详见任务2文档 §8b.4.5（完整密度对比表+多线程/重复执行的补充实测）。**该问题会影响条目8的预期收益**：条目8落地后 Q9 新增命中的 `lineitem+part⋈orders` join，build侧同样是被过滤收窄的 `orders`，密度特征与 Q10 暴涨的那个join相同，需要在条目8验收时同步验证耗时而非只看命中率。建议后续单独立项，把"按实际到达行数动态调整位图/rowid range"或"低密度自动回退"作为专项优化方向。
+条目8b 和条目8 均已完成。下一步建议优先处理密度问题（§8b.4.5）：`BitmapJoinExecutor` 的 `payload_columns` 按 bitmap_size（静态PK全表行数）分配，不适应"build侧被上游过滤器大幅收窄"的低密度场景，导致 Q5 新命中 join wall-clock 增68%（158→266ms）、Q10 既有命中 join 增36%（219→298ms）。可能方向：按实际到达的 build 行数动态选择 payload 分配大小，或在密度低于某阈值时自动回退到普通 HashJoin。

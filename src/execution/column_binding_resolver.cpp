@@ -33,6 +33,15 @@ void ColumnBindingResolver::VisitOperator(LogicalOperator &op) {
 		if (comp_join.bhj_probe_ref_ref) {
 			VisitExpression(&comp_join.bhj_probe_ref_ref);
 		}
+		// 条目8 (b_idea/6.4遗漏问题 任务2): resolve bhj_passthrough_refs expressions against
+		// the LHS bindings (same context as bhj_probe_ref_ref). These are hidden columns from the
+		// LEFT child that bypass the join's normal [left][right] output layout and are appended
+		// at the end via bhj_passthrough_refs. The resolved BoundReferenceExpression.index is the
+		// position in the LEFT child's output chunk, which the physical PhysicalHashJoin uses to
+		// append the column to its output after [lhs_output][rhs_output].
+		for (auto &expr : comp_join.bhj_passthrough_refs) {
+			VisitExpression(&expr);
+		}
 		// visit the duplicate eliminated columns on the LHS, if any
 		for (auto &expr : comp_join.duplicate_eliminated_columns) {
 			VisitExpression(&expr);
@@ -196,12 +205,16 @@ unique_ptr<Expression> ColumnBindingResolver::VisitReplace(BoundColumnRefExpress
 	for (idx_t i = 0; i < bindings.size(); i++) {
 		if (expr.binding == bindings[i]) {
 			if (!types.empty()) {
-				if (bindings.size() != types.size()) {
-					throw InternalException(
-					    "Failed to bind column reference \"%s\" [%d.%d]: inequal num bindings/types (%llu != %llu)",
-					    expr.GetAlias(), expr.binding.table_index, expr.binding.column_index, bindings.size(),
-					    types.size());
-				}
+			if (bindings.size() != types.size()) {
+				// 条目8 debug
+				fprintf(stderr, "DEBUG: bindings.size()=%zu types.size()=%zu binding=[%d.%d] alias=%s\n",
+				        bindings.size(), types.size(), expr.binding.table_index, expr.binding.column_index,
+				        expr.GetAlias().c_str());
+				throw InternalException(
+				    "Failed to bind column reference \"%s\" [%d.%d]: inequal num bindings/types (%llu != %llu)",
+				    expr.GetAlias(), expr.binding.table_index, expr.binding.column_index, bindings.size(),
+				    types.size());
+			}
 				if (expr.return_type != types[i]) {
 					throw InternalException("Failed to bind column reference \"%s\" [%d.%d]: inequal types (%s != %s)",
 					                        expr.GetAlias(), expr.binding.table_index, expr.binding.column_index,

@@ -81,6 +81,15 @@ PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoi
 		// operator so EXPLAIN can display it via ParamsToString.
 		hash_join.bhj_skip_reason = op.bhj_skip_reason;
 
+		// 条目8 (b_idea/6.4遗漏问题 任务2): carry over the passthrough hidden columns
+		// (bhj_passthrough_refs, already flattened to BoundReferenceExpression by
+		// ColumnBindingResolver) as physical LHS input indices. This is independent of whether
+		// this join itself ends up using BHJ - both the regular HashJoin/perfect-hash-join path
+		// and the BHJ ProbeBitmap path append these columns after the normal output columns
+		// (see PhysicalHashJoin::ExecuteInternal / BitmapJoinExecutor::ProbeBitmap).
+		for (auto &expr : op.bhj_passthrough_refs) {
+			hash_join.passthrough_lhs_col_idxs.push_back(expr->Cast<BoundReferenceExpression>().index);
+		}
 
 		// Bitmap-Join hook: plan-time enablement. Two paths feed into the same PK binding:
 		//   1. Test-only force override (BitmapJoinMetaRegistry::SetForceResolvedPK), kept as a
@@ -91,20 +100,38 @@ PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoi
 		//      table was confirmed to be on the build side, stashed the result on
 		//      `op.bhj_hint`. When absent (open_bitmap_join=false, no registry match, or the FK
 		//      table landed on the build side) we simply fall back to a regular hash join.
-		auto &registry = BitmapJoinMetaRegistry::Get(context);
-		optional_ptr<const BitmapJoinPKBinding> pk;
-		if (bhj_eligible && registry.IsForceBitmapJoin() && registry.GetForceResolvedPK()) {
-			pk = registry.GetForceResolvedPK();
-		} else if (bhj_eligible && op.bhj_hint) {
-			// Defensive double-check (条目2): even if some future code path bypassed
-			// BitmapJoinResolver and set bhj_hint directly, never wire up a reversed binding -
-			// BitmapJoinExecutor only supports build_is_pk_side == true.
-			D_ASSERT(op.bhj_hint->build_is_pk_side);
-			if (op.bhj_hint->build_is_pk_side) {
-				pk = op.bhj_hint->pk;
+	auto &registry = BitmapJoinMetaRegistry::Get(context);
+	optional_ptr<const BitmapJoinPKBinding> pk;
+	bool bhj_forced = false;
+	if (bhj_eligible && registry.IsForceBitmapJoin() && registry.GetForceResolvedPK()) {
+		pk = registry.GetForceResolvedPK();
+		bhj_forced = true;
+	} else if (bhj_eligible && op.bhj_hint) {
+		// Defensive double-check (条目2): even if some future code path bypassed
+		// BitmapJoinResolver and set bhj_hint directly, never wire up a reversed binding -
+		// BitmapJoinExecutor only supports build_is_pk_side == true.
+		D_ASSERT(op.bhj_hint->build_is_pk_side);
+		if (op.bhj_hint->build_is_pk_side) {
+			pk = op.bhj_hint->pk;
+		}
+	}
+	if (pk) {
+		// 初期方案 4.2 (perf/sf5/combine锁 / 根因分析-详细版.md §4.2): 低密度回退。
+		// 估计 build 侧密度 = build(右)子节点基数 / 整张 PK 维度表行数。低密度意味着 bitmap
+		// 稀疏、payload 仍按全维度行数分配 → gather 散布 cache miss；此时 BHJ 反而不如普通/
+		// perfect 哈希 join，直接回退。仅对自动解析路径生效；force 覆盖(测试)不受影响。
+		if (!bhj_forced && false) {
+			const double est_density = (pk->row_count > 0)
+			                             ? static_cast<double>(right.estimated_cardinality) /
+			                                   static_cast<double>(pk->row_count)
+			                             : 1.0;
+			if (est_density < BHJ_LOW_DENSITY_THRESHOLD) {
+				hash_join.bhj_skip_reason = BitmapJoinSkipReason::LOW_DENSITY;
+				pk = nullptr; // 不走 BHJ，下方回退到普通哈希 join
 			}
 		}
-		if (pk) {
+	}
+	if (pk) {
 			hash_join.use_bitmap_join = true;
 			hash_join.bitmap_join_resolved.pk = pk.get();
 			hash_join.bitmap_join_resolved.fk = nullptr; // not needed for BHJ build/probe

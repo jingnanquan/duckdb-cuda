@@ -156,27 +156,23 @@ TracedBinding TraceBindingToGet(LogicalOperator &op, ColumnBinding binding) {
 		// why RemoveUnusedColumns itself only ever rewrites column references for INNER joins
 		// (see remove_unused_columns.cpp: `if (comp_join.join_type != JoinType::INNER) break;`).
 		//
-		// Even for INNER joins, though, propagating (i.e. *growing*) through the LEFT side is
-		// unsafe and NOT supported: the join's own combined output is always laid out as
-		// [left's bindings][right's bindings], in that fixed order (LogicalJoin::GetColumnBindings
-		// concatenates, never reorders across sides). Some ancestor further up the plan may
-		// already reference this join's RIGHT-side contributions via *absolute* positions baked
-		// in by an earlier optimizer pass (e.g. its own left/right_projection_map, computed once
-		// by RemoveUnusedColumns long before we run) - growing the LEFT side inserts a new entry
-		// *before* those positions and silently shifts all of them, corrupting any such
-		// unrelated ancestor reference (this is exactly what caused a real, reproduced crash on
-		// TPCH Q5's `orders JOIN lineitem` chain during development). Growing the RIGHT side is
-		// always safe, since nothing in this join's own output layout follows it. So: only the
-		// RIGHT side is ever marked as a supported propagation hop; a LEFT-side match still finds
-		// the underlying Get (for 条目1/2's catalog-name-only purposes) but is downgraded to
-		// path_complete=false, so PropagateHiddenColumn is never attempted across it - the
-		// consuming join safely falls back to a regular hash join instead.
+		// 条目8: for INNER joins, BOTH sides are now supported propagation hops. The RIGHT side
+		// grows right_projection_map (safe: RIGHT part is at the end of [left][right], so growing
+		// it doesn't shift anything). The LEFT side uses bhj_passthrough_refs (条目8): instead of
+		// growing left_projection_map (which would insert in the MIDDLE of [left][right] and shift
+		// all RIGHT-side positions, corrupting ancestor projection_maps), the hidden column is
+		// appended at the physical END of the join's output via LogicalComparisonJoin::
+		// bhj_passthrough_refs. This is always safe: nothing follows the end. See §8.2-8.4.
 		bool join_is_inner = op.Cast<LogicalComparisonJoin>().join_type == JoinType::INNER;
 		auto left_result = TraceBindingToGet(*op.children[0], binding);
 		if (left_result.get) {
-			// LEFT side: never safe to grow - see comment above.
-			left_result.path_complete = false;
-			left_result.incomplete_due_to_left_side = true;
+			if (join_is_inner) {
+				// 条目8: LEFT side of an INNER join is now supported via bhj_passthrough_refs.
+				left_result.path.emplace(left_result.path.begin(), op, PropagationSide::LEFT);
+			} else {
+				left_result.path_complete = false;
+				left_result.incomplete_due_to_left_side = true;
+			}
 			return left_result;
 		}
 		auto right_result = TraceBindingToGet(*op.children[1], binding);
@@ -373,25 +369,70 @@ unique_ptr<Expression> PropagateHiddenColumn(LogicalGet &get, const vector<PathS
 			// else: filter is a transparent pass-through - `binding` / `child_binding_pos`
 			// carry over unchanged to whatever operator comes next up the path.
 		} else {
-			// 条目4: intermediate plain-INNER LOGICAL_COMPARISON_JOIN, always reached via its
-			// RIGHT side (see TraceBindingToGet - growing the LEFT side is never recorded as a
-			// supported hop, since it would shift the absolute positions of everything in the
-			// RIGHT side, corrupting any unrelated ancestor that already references this join's
-			// RIGHT-side output by absolute position). Growing right_projection_map itself is
-			// always safe: nothing in this join's own output layout follows the RIGHT part.
+			// 条目4/条目8: intermediate plain-INNER LOGICAL_COMPARISON_JOIN. Two cases:
+			//
+			// RIGHT side (条目4): growing right_projection_map is always safe - nothing in this
+			// join's own output layout follows the RIGHT part. If right_projection_map is empty,
+			// the column flows through automatically (identity passthrough), just offset by
+			// left_len to get the position in the combined [left][right] output.
+			//
+			// LEFT side (条目8): growing left_projection_map would insert in the MIDDLE of [left]
+			// [right], shifting all RIGHT-side positions and corrupting ancestor projection_maps.
+			// Instead, push a BoundColumnRefExpression into bhj_passthrough_refs - this appends
+			// the hidden column at the physical END of the join's output (after [left][right]),
+			// which is always safe. The binding VALUE is preserved as-is: ColumnBindingResolver
+			// will find it in the join's GetColumnBindings() output (which includes passthrough
+			// bindings at the end) and resolve it to the correct position.
 			D_ASSERT(cur.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN);
-			D_ASSERT(step.side == PropagationSide::RIGHT);
 			auto &join = cur.Cast<LogicalComparisonJoin>();
-			if (!join.right_projection_map.empty()) {
-				child_binding_pos = FindOrAppend(join.right_projection_map, child_binding_pos);
+			if (step.side == PropagationSide::LEFT) {
+				// 条目8: The hidden column was just injected into the Get and is now at the END of
+				// the left child's output (position N-1). If left_projection_map is empty (identity
+				// passthrough), the hidden column would automatically appear in the LEFT part of
+				// this join's output, shifting the RIGHT part and corrupting ancestor
+				// projection_maps. To prevent this, explicitly set left_projection_map to select only
+				// the ORIGINAL columns (positions 0..N-2), excluding the hidden column at N-1.
+				// If left_projection_map is already non-empty, it was set by RemoveUnusedColumns
+				// before the hidden column existed, so it already excludes position N-1 - no change
+				// needed. Either way, the hidden column is NOT in the LEFT part of the join's output.
+				if (join.left_projection_map.empty()) {
+					idx_t left_child_width = join.children[0]->GetColumnBindings().size();
+					// left_child_width includes the hidden column (just injected at position N-1).
+					// Set left_projection_map to [0, 1, ..., N-2] to select all original columns.
+					join.left_projection_map.reserve(left_child_width - 1);
+					for (idx_t i = 0; i < left_child_width - 1; i++) {
+						join.left_projection_map.push_back(i);
+					}
+				}
+				// Push the hidden column into bhj_passthrough_refs - this appends it at the
+				// physical END of the join's output (after [left][right]), which is always safe:
+				// nothing follows it, so no existing positions shift.
+				join.bhj_passthrough_refs.push_back(
+				    make_uniq<BoundColumnRefExpression>(column_name, column_type, binding));
+				join.bhj_passthrough_bindings.push_back(binding);
+				// child_binding_pos = position of this passthrough column in the join's combined
+				// output, in case a parent operator in the path needs to reference it positionally.
+				idx_t left_len = join.left_projection_map.size();
+				idx_t right_len = join.right_projection_map.empty()
+				                      ? join.children[1]->GetColumnBindings().size()
+				                      : join.right_projection_map.size();
+				child_binding_pos = left_len + right_len + (join.bhj_passthrough_refs.size() - 1);
+				// binding VALUE is untouched: the hidden column's binding is NOT in the LEFT part
+				// (we excluded it), so ColumnBindingResolver will find it ONLY in the passthrough
+				// section of GetColumnBindings() - at the correct position.
+			} else {
+				D_ASSERT(step.side == PropagationSide::RIGHT);
+				if (!join.right_projection_map.empty()) {
+					child_binding_pos = FindOrAppend(join.right_projection_map, child_binding_pos);
+				}
+				// else: identity passthrough on the right side - child_binding_pos (position within
+				// the right child's own output) is already correct once offset by the left width.
+				idx_t left_len = join.left_projection_map.empty() ? join.children[0]->GetColumnBindings().size()
+				                                                   : join.left_projection_map.size();
+				child_binding_pos += left_len;
+				// binding VALUE is untouched: LogicalJoin::GetColumnBindings selects/reorders via
+				// MapBindings but never retags with its own table_index (unlike LogicalProjection).
 			}
-			// else: identity passthrough on the right side - child_binding_pos (position within
-			// the right child's own output) is already correct once offset by the left width.
-			idx_t left_len = join.left_projection_map.empty() ? join.children[0]->GetColumnBindings().size()
-			                                                   : join.left_projection_map.size();
-			child_binding_pos += left_len;
-			// binding VALUE is untouched: LogicalJoin::GetColumnBindings selects/reorders via
-			// MapBindings but never retags with its own table_index (unlike LogicalProjection).
 		}
 	}
 	// IMPORTANT: every operator we just touched (Projection.expressions / Filter.projection_map /

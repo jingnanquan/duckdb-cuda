@@ -1,11 +1,32 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/common/enum_util.hpp"
 
 namespace duckdb {
 
 LogicalComparisonJoin::LogicalComparisonJoin(JoinType join_type, LogicalOperatorType logical_type)
     : LogicalJoin(join_type, logical_type) {
+}
+
+vector<ColumnBinding> LogicalComparisonJoin::GetColumnBindings() {
+	// Start with the normal [left][right] layout from LogicalJoin.
+	auto result = LogicalJoin::GetColumnBindings();
+	// 条目8: append passthrough hidden columns at the physical END of the join's output.
+	// Use the stored bindings (bhj_passthrough_bindings) rather than reading from the
+	// expressions, because ColumnBindingResolver may have already replaced the
+	// BoundColumnRefExpression with a BoundReferenceExpression (losing the original binding).
+	result.insert(result.end(), bhj_passthrough_bindings.begin(), bhj_passthrough_bindings.end());
+	return result;
+}
+
+void LogicalComparisonJoin::ResolveTypes() {
+	// Start with the normal [left][right] types from LogicalJoin.
+	LogicalJoin::ResolveTypes();
+	// 条目8: append types for passthrough hidden columns, matching GetColumnBindings().
+	for (auto &expr : bhj_passthrough_refs) {
+		types.push_back(expr->return_type);
+	}
 }
 
 InsertionOrderPreservingMap<string> LogicalComparisonJoin::ParamsToString() const {

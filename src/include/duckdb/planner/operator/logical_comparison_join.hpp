@@ -72,11 +72,34 @@ public:
 	//! EXPLAIN can show a reason for every HASH_JOIN node without one-off debug prints.
 	BitmapJoinSkipReason bhj_skip_reason = BitmapJoinSkipReason::NOT_PROCESSED;
 
+	//! 条目8 (b_idea/6.4遗漏问题 任务2): "passthrough" hidden columns that bypass this join's
+	//! normal [left][right] output layout and are appended at the physical END of the join's
+	//! output, so they don't shift any existing positions. Populated by PropagateHiddenColumn
+	//! when a hidden column (_rowid/*_ref) needs to cross this join's LEFT side to reach an
+	//! ancestor BHJ candidate join. Growing the LEFT side in the normal [left][right] layout
+	//! would insert in the middle and shift all RIGHT-side positions, corrupting any ancestor
+	//! projection_map that already references this join's RIGHT-side output by absolute position
+	//! (see §8.2 root cause analysis). Appending at the end is always safe: nothing follows it.
+	//! Each entry is a BoundColumnRefExpression referencing the hidden column's current binding
+	//! (from the child subtree below this join); ColumnBindingResolver will flatten it into a
+	//! BoundReferenceExpression just like any other column reference. Only populated for INNER
+	//! joins (the only type BHJ supports). Empty (zero effect) in the common case.
+	vector<unique_ptr<Expression>> bhj_passthrough_refs;
+	//! 条目8: parallel to bhj_passthrough_refs - stores the original ColumnBinding of each
+	//! passthrough column. Needed because ColumnBindingResolver replaces the BoundColumnRefExpression
+	//! with a BoundReferenceExpression (losing the original binding), but GetColumnBindings()
+	//! still needs to return the original binding for ancestor operators to find.
+	vector<ColumnBinding> bhj_passthrough_bindings;
+
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
+	vector<ColumnBinding> GetColumnBindings() override;
 
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<LogicalOperator> Deserialize(Deserializer &deserializer);
+
+protected:
+	void ResolveTypes() override;
 
 public:
 	static unique_ptr<LogicalOperator> CreateJoin(ClientContext &context, JoinType type, JoinRefType ref_type,

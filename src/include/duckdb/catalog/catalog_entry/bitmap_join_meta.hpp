@@ -92,7 +92,18 @@ enum class BitmapJoinSkipReason : uint8_t {
 	//! Non-dense rowid propagation needed but the trace path crossed some other operator type
 	//! PropagateHiddenColumn doesn't support (e.g. Aggregate, non-INNER join, ASOF/DELIM join).
 	PATH_INCOMPLETE_OTHER,
+	//! BHJ was eligible and auto-resolved, but the estimated build density (build child
+	//! cardinality / PK dimension row count) is below the low-density threshold, so BHJ is
+	//! skipped in favour of a regular/perfect hash join (perf optimization, mode-1 early phase,
+	//! perf/sf5/combine锁, 见 根因分析-详细版.md §4.2).
+	LOW_DENSITY,
 };
+
+//! 初期方案 4.2 (perf/sf5/combine锁, 根因分析-详细版.md §4.2): 计划期低密度阈值。
+//! 当估计 build 密度 (= build 子节点基数 / PK 维度表行数) 低于此值时, BHJ 回退到
+//! 普通/perfect 哈希 join。初期用常量实现, 后续应改为可调 setting (见文档 §5.1 的
+//! BitmapJoinMaxPayloadBytesSetting / 密度阈值建议)。
+constexpr double BHJ_LOW_DENSITY_THRESHOLD = 0.3;
 
 //! Human-readable (snake_case) name for a BitmapJoinSkipReason, used in EXPLAIN output.
 DUCKDB_API string BitmapJoinSkipReasonToString(BitmapJoinSkipReason reason);

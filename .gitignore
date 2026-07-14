@@ -20,7 +20,9 @@
 .DS_store
 # Core files
 #core
-*.csv
+# CSV files are now tracked. gitignore cannot filter by file size, so the
+# 200KB limit is enforced by .git/hooks/pre-commit (large CSVs are auto-skipped).
+#*.csv
 *.sql
 .github/
 

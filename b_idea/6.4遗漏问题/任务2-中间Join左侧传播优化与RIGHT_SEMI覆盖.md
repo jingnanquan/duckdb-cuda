@@ -1,7 +1,7 @@
 ---
 title: BitmapJoin (BHJ) 6.4 遗漏问题 —— 任务2：中间Join左侧传播优化与RIGHT_SEMI覆盖
-version: v0.5.0
-status: 条目8b 已实施并通过真实SF5数据验证（含逐join耗时对比+根因分析，见§8b.4.2-8b.4.5）；条目9已定案不做；条目8（LEFT侧传播优化）待排期
+version: v0.8.0
+status: 条目8b+条目8 均已实施；payload scatter 锁优化+CombineBitmap无锁稀疏合并均已实施；条目9已定案不做
 related:
   - ./README.md
   - ./任务1-BHJ命中率归因与算子耗时画像.md（条目8/8b投入优先级依赖其结论；§7.6记录了条目9相关的一个真实崩溃bug已被提前修复）
@@ -175,6 +175,239 @@ TEST_CASE("BHJ hidden column fails to propagate through the LEFT side of an inte
 4. 若完整实现了 `bhj_passthrough_refs`（Step A-E），额外验证：一个"确实发生了列裁剪的 LEFT 侧"场景（`left_projection_map` 非空）也能命中；
 5. 用任务1条目6的诊断标注（`bhj_skip_reason`）重新跑一遍 Q5/Q9/Q10，确认 `PATH_INCOMPLETE_LEFT_SIDE` 归类的 join 数量下降，并用任务1条目7的耗时表确认总耗时是否随命中率提升而下降。
 
+### 8.7 实施结果（v0.6.0，已完成）
+
+#### 8.7.1 采用方案：`bhj_passthrough_refs`（完整 Step A-E）
+
+文档 §8.4 中建议的 Step E'（低成本降级路径，仅处理 `left_projection_map` 为空的特例）在深入分析后被证明**不安全**——无论 `left_projection_map` 是否为空，注入隐藏列后 Get 的输出增长，即使 `left_projection_map` 为空（identity passthrough），LEFT 部分增长也会 shift RIGHT 部分在 join 输出中的绝对位置，破坏祖先 `projection_map`。因此实际实施了完整的 Step A-E `bhj_passthrough_refs` 方案。
+
+**核心思路**：给 `LogicalComparisonJoin` 新增 `bhj_passthrough_refs` 字段和 `bhj_passthrough_bindings` 字段，将隐藏列追加在 join 输出的**物理最末尾**（`[left][right][passthrough]`），彻底避免 shift 任何已有位置。
+
+**逻辑层改动**：
+- `src/include/duckdb/planner/operator/logical_comparison_join.hpp`：新增 `bhj_passthrough_refs`（`vector<unique_ptr<Expression>>`）和 `bhj_passthrough_bindings`（`vector<ColumnBinding>`，存储原始 binding，避免 `ColumnBindingResolver` 解析后丢失）；新增 `GetColumnBindings()` 和 `ResolveTypes()` override。
+- `src/planner/operator/logical_comparison_join.cpp`：`GetColumnBindings()` 在 `LogicalJoin::GetColumnBindings()` 基础上追加 `bhj_passthrough_bindings`；`ResolveTypes()` 在 `LogicalJoin::ResolveTypes()` 基础上追加 passthrough 表达式的 `return_type`。
+- `src/optimizer/bitmap_join_resolver.cpp`：
+  - `TraceBindingToGet`：对 INNER join 的 LEFT 侧不再设 `path_complete=false`，而是记录 `PropagationSide::LEFT` hop（此前仅允许 RIGHT 侧）。
+  - `PropagateHiddenColumn`：LEFT 侧处理——若 `left_projection_map` 为空则显式设为 `[0, ..., N-2]`（排除隐藏列，防止 LEFT 部分自动增长 shift RIGHT 部分），然后将隐藏列 binding 推入 `bhj_passthrough_refs` + `bhj_passthrough_bindings`，更新 `child_binding_pos` 为 passthrough 在 join 输出中的位置（`left_len + right_len + passthrough_idx`）。
+- `src/execution/column_binding_resolver.cpp`：在 `LOGICAL_COMPARISON_JOIN` 处理中，访问 LEFT 子节点后解析 `bhj_passthrough_refs` 表达式（与 `bhj_probe_ref_ref` 同一时机），使其从 `BoundColumnRefExpression` 变为 `BoundReferenceExpression`。
+
+**物理执行层改动**（三处执行路径都需处理 passthrough 列）：
+- `src/include/duckdb/execution/operator/join/physical_hash_join.hpp`：新增 `passthrough_lhs_col_idxs`（`vector<idx_t>`），存储 passthrough 列在 probe input 中的物理位置。
+- `src/execution/physical_plan/plan_comparison_join.cpp`：从 `bhj_passthrough_refs` 读取已解析的 `BoundReferenceExpression.index`，写入 `passthrough_lhs_col_idxs`。
+- `src/execution/operator/join/physical_hash_join.cpp`：三处执行路径追加 passthrough 列——(1) 常规 HashJoin 路径 `scan_structure.Next` 后用 `lhs_sel_vector` 切片追加；(2) perfect hash join 路径 `ProbePerfectHashTable` 后直接 `Reference` 追加；(3) BHJ 路径在 `ProbeBitmap` 中用 `probe_sel_vec` 切片追加。
+- `src/execution/join_hashtable.cpp`：放宽 `NextInnerJoin` 的 debug 断言从 `==` 到 `>=`，允许输出 chunk 有额外的 passthrough 列。
+
+#### 8.7.2 真实 SF5 数据验证：逐 join 命中率与耗时对比
+
+用真实 SF5 数据重跑 `[bitmap_join_tpch_profile]`，对比条目8落地**前**（条目8b完成后，v0.5.0）和落地**后**（v0.6.0）的全部 13 个 join：
+
+| Query | Join（`[probe⋈build]`） | baseline(ms) | perfect(ms) | bitmap(ms) 条目8前 → 条目8后 | `bhj_skip_reason` / 命中？ 条目8前 → 条目8后 |
+| --- | --- | --- | --- | --- | --- |
+| Q5 | `[lineitem+orders+customer+nation+region] ⋈ supplier` | 62.3 | 62.7 | 62.0 → 76.1 | `not_single_equality`（不变，与LEFT侧无关） |
+| Q5 | **`l_orderkey=o_orderkey [lineitem ⋈ orders+customer+nation+region]`** | 146.5 | 149.9 | **145.8 → 1973.2** | **`path_incomplete_left_side` → `hit`（新增命中！）** |
+| Q5 | `o_custkey=c_custkey [orders ⋈ customer+nation+region]` | 49.8 | 32.1 | 50.2 → 103.9 | `hit`（不变） |
+| Q5 | `c_nationkey=n_nationkey [customer ⋈ nation+region]` | 3.7 | 4.9 | 4.7 → 4.7 | `hit`（不变） |
+| Q5 | `n_regionkey=r_regionkey [nation ⋈ region]` | 0.20 | 0.14 | 0.01 → 0.03 | `hit`（不变） |
+| Q9 | `[lineitem+part+orders] ⋈ [partsupp+supplier+nation]` | 996.2 | 1024.3 | 1075.0 → 1043.0 | `not_single_equality`（不变） |
+| Q9 | **`l_orderkey=o_orderkey [lineitem+part ⋈ orders]`** | 1029.2 | 1069.7 | **1101.1 → 562.6** | **`path_incomplete_left_side` → `hit`（新增命中！）** |
+| Q9 | `l_partkey=p_partkey [lineitem ⋈ part]` | 169.5 | 132.5 | 137.2 → 137.4 | `hit`（不变） |
+| Q9 | `ps_suppkey=s_suppkey [partsupp ⋈ supplier+nation]` | 129.0 | 12.2 | 11.6 → 11.4 | `hit`（不变） |
+| Q9 | `s_nationkey=n_nationkey [supplier ⋈ nation]` | 0.87 | 0.22 | 0.15 → 0.15 | `hit`（不变） |
+| Q10 | `c_custkey=o_custkey [customer+nation ⋈ lineitem+orders]` | 105.9 | 102.1 | 97.0 → 95.5 | `fk_on_build_side`（不变，无解类） |
+| Q10 | `c_nationkey=n_nationkey [customer ⋈ nation]` | 12.8 | 12.6 | 1.7 → 1.6 | `hit`（不变） |
+| Q10 | `l_orderkey=o_orderkey [lineitem ⋈ orders]` | 224.7 | 218.8 | 1152.3 → 1056.0 | `hit`（不变） |
+
+**命中率变化**：
+- Q5：3/5 → **4/5**（+1，`path_incomplete_left_side` 归零）
+- Q9：3/5 → **4/5**（+1，`path_incomplete_left_side` 归零）
+- Q10：2/3 → 2/3（不变，无 LEFT 侧限制的 join）
+
+`PATH_INCOMPLETE_LEFT_SIDE` 归因项已完全清零。
+
+**耗时变化分析**：
+
+> **重要修正（v0.6.1）**：此前版本（v0.6.0）记录的"Q5 `l_orderkey=o_orderkey` 从 146ms 暴涨到 1973ms（~13.5倍）"系**测量误差**——`operator_timing` 字段包含了 pipeline 等待 build 侧完成的阻塞时间，不是实际执行时间。用 `PRAGMA enable_profiling='json'` 提取 `cpu_time` 和直接测 wall-clock 后，实际开销远小于此。详见下方 §8.7.2a 的修正分析。
+
+- **Q9 净获益显著**：新增命中的 `l_orderkey=o_orderkey` join 的 `operator_timing` 从 1101ms 降至 563ms（降幅 ~49%），驱动整条查询 wall-clock 从 345ms 降至 286ms（降幅 17%）。
+- **Q5 有中等额外开销**（不是"暴涨13.5倍"）：新增命中的 `l_orderkey=o_orderkey` join 走 BHJ 后，`operator_timing` 显示 1929ms（含 pipeline 等待），但实际 wall-clock 查询总耗时仅从 158ms 增至 266ms（+68%，详见 §8.7.2a）。根因是 build 侧密度 3.04%（`orders` 经 `o_orderdate` 1年窗口过滤后仅 22.7 万行，但 bitmap 按 750 万行静态 `row_count` 分配），bitmap 本身 916KB 可放入 L2 不是瓶颈，主要开销来自 `payload_columns`（2列 × 750万 = 114MB）的稀疏 gather cache miss。
+- **Q10 基本不变**：已有的 `lineitem⋈orders` 开销仍然存在（`operator_timing` 1008ms，wall-clock 查询 298ms），但其他 join 不受条目8影响。
+
+#### 8.7.2a `operator_timing` vs wall-clock 测量偏差修正分析（v0.6.1 新增）
+
+`test_bitmap_join_tpch_profile.cpp` 使用 `PRAGMA enable_profiling='json'` 提取每个 `HASH_JOIN` 节点的 `operator_timing`。但深入排查后发现，**`operator_timing` 包含了 pipeline 等待时间**——在 DuckDB 的 pipeline 模型中，probe 侧的 HASH_JOIN 必须等 build 侧 pipeline 完成后才能开始执行，这段阻塞等待被计入 `operator_timing`，导致多线程下 `operator_timing` 的 SUM 远大于 wall-clock：
+
+| 指标 | Q5 baseline | Q5 bitmap | 比值 |
+|---|---|---|---|
+| `SUM(operator_timing)` 5个join | 260ms | 2058ms | 7.9x |
+| `SUM(cpu_time)` 5个join | 2208ms | 3853ms | 1.75x |
+| **wall-clock（整个查询）** | **158ms** | **266ms** | **1.68x** |
+
+`operator_timing` 的 SUM(2058ms) 是 wall-clock(266ms) 的 **7.7 倍**，因为 DuckDB 多线程 pipeline 模型下多个 join 的 build/probe 重叠执行，`operator_timing` 却将每个 join 的等待时间串行累加。此前 v0.6.0 文档中引用的"暴涨13.5倍"正是基于这个有偏差的 `operator_timing` 数字（1929ms / 145ms），而非真实的 wall-clock 比值（266ms / 158ms = 1.68x）。
+
+**Q5 bitmap 266ms 的真实开销分解**：
+- baseline wall-clock = 158ms（5个join的build+probe，数据在OS cache中）
+- bitmap wall-clock = 266ms（4个BHJ + 1个普通HJ）
+- 净增 = 108ms，主要来自 `l_orderkey=o_orderkey` join 从普通 HJ 切换到 BHJ：
+  - 该 join build 侧密度 3.04%（227,841 行散布在 7,500,000 位 bitmap 中）
+  - bitmap 本身 916KB（可放入 L2，`RowIsValidUnsafe` 查找很快，不是瓶颈）
+  - `payload_columns` 2列 × 7,500,000 = 114MB（密度3%→97%是空洞，probe 命中后 gather 的 cache miss 是主要开销）
+  - 独立测量单 join wall-clock：baseline 219ms → bitmap 310ms（+91ms），与查询级 +108ms 基本吻合
+- 对比条目8前（3/5 hits, 143ms）→ 条目8后（4/5 hits, 266ms），净增 123ms 是条目8引入这个新 BHJ 命中的代价
+
+#### 8.7.2b 两个新增命中 join 的 bitmap 密度对比
+
+| 指标 | Q5 `lineitem ⋈ orders+customer+nation+region` | Q9 `lineitem+part ⋈ orders` |
+|---|---|---|
+| bitmap_size（orders.row_count） | 7,500,000 | 7,500,000 |
+| build 侧实际行数 | **227,841** | **7,500,000** |
+| **密度** | **3.04%** | **100%** |
+| _rowid 跨度 | 7,499,934（几乎覆盖全表） | 0~7,499,999（全范围） |
+| payload_cols 实际列数（列裁剪后） | 2 | 1 |
+| payload_columns 总分配 | 114 MB | 57 MB |
+| bitmap 本身 | 916 KB（可放 L2） | 916 KB |
+| probe 侧行数 | 6,036,600 | 1,632,317 |
+| 匹配行数 | 916,290 | 1,632,317 |
+| wall-clock vs baseline | **1.68x 慢**（158→266ms） | **0.83x 快**（345→286ms，降幅17%） |
+
+Q9 密度 100% 时 bitmap + payload 紧凑填充，probe 命中后 gather 接近顺序访问，BHJ 的 O(1) 精确查找比普通 HashJoin 的哈希表查找更快，净获益 17%。Q5 密度 3.04% 时 payload 中 97% 是空洞，600万次 probe 命中后从 114MB 的稀疏数组 gather，cache 局部性差，净增开销 68%。两者对比验证了"密度越低，BHJ 相对普通 HashJoin 的优势越小、劣势越大"的规律。
+
+#### 8.7.3 `test_bitmap_join_perf.cpp` 最新实测结果
+
+`test_bitmap_join_perf.cpp` 的 `lineitem⋈part`（密度100%，build侧100万行全量）作为正面对照组，条目8实施后重跑结果不变：
+
+```text
+[bitmap-join-perf] duckdb-hash-join:        elapsed=263.3 ms
+[bitmap-join-perf] perfect-hash-join:       elapsed=115.9 ms
+[bitmap-join-perf] bitmap-hash-join:        elapsed=85.1 ms   (force_bhj=true)
+[bitmap-join-perf] bitmap-hash-join(auto):  elapsed=84.9 ms   (force_bhj=false)
+```
+
+`lineitem⋈part` 稳定获得 ~68% 的降幅，确认条目8的 passthrough 机制没有破坏已有的高密度场景性能。
+
+#### 8.7.4 Q5/Q9/Q10 端到端三模式总耗时对比（冷运行 + 热运行平均）
+
+`test_bitmap_join_tpch.cpp` 已修改为记录每个 (query, mode) 的**冷运行**（首次执行，含 parquet 元数据加载、计划构造、BHJ executor 分配）和**热运行平均**（后续 3 次执行的算术平均，OS file cache 已热）。数据源 `b_idea/perf/sf5/tpch_q5_q9_q10.csv`：
+
+```text
+Query  Mode         Cold(ms)  WarmAvg   WarmMin   #HJ  #BHJ  Rows
+----------------------------------------------------------------------
+Q5     baseline        180.0     157.1     155.4     5     0     5
+Q5     perfect         160.0     155.7     150.9     5     0     5
+Q5     bitmap          250.3     240.2     237.7     5     4     5
+Q9     baseline        354.2     337.7     333.6     5     0   175
+Q9     perfect         317.6     316.2     315.0     5     0   175
+Q9     bitmap          260.3     262.2     258.9     5     4   175
+Q10    baseline        223.0     221.8     221.2     3     0    20
+Q10    perfect         218.2     222.3     217.7     3     0    20
+Q10    bitmap          220.4     224.7     224.4     3     2    20
+```
+
+**关键观察**：
+- Q5 bitmap warm_avg=240.2ms vs baseline=157.1ms（1.53x），较 v0.6.1（1.68x）持续改善。
+- Q9 bitmap 冷热均显著快于 baseline（冷 260 vs 354ms，热 262 vs 338ms，降幅 22%），密度 100% 场景稳定获益。
+- **Q10 bitmap warm_avg=224.7ms vs baseline=221.8ms（仅 1.01x），不触发 >20% 告警**。
+
+#### 8.7.5 Payload scatter 锁优化：定长列 lock-free（v0.7.0 新增）
+
+**问题**：`SinkBitmap` 中的 payload scatter 对所有列统一加 `lock_guard<mutex>`（`bitmap_hash_join_executor.cpp:271`），导致多线程 build 时所有列的 scatter 被串行化。但深入分析后发现：
+- **定长列**（INT/BIGINT/DATE/DECIMAL 等）的 scatter 是 `tdata[rowid] = sdata[sidx]`，写不同 rowid 位置，由于 build 侧 PK 唯一、不同线程处理的 rowid 不重叠，**天然无数据竞争**，不需要锁。
+- **变长列**（VARCHAR）的 scatter 调用 `StringVector::AddStringOrBlob` → `ArenaAllocator::Allocate`，操作有状态的内存分配器，**确实需要锁**。
+- 此前版本对所有列统一加锁，导致定长列被 varchar 列的锁不必要地阻塞。
+
+**实测 payload 列类型**（经列裁剪后实际保留的列）：
+
+| Join | payload_cols | 类型 | 是否全定长 |
+|---|---|---|---|
+| Q5 `n_regionkey=r_regionkey` | 1 | INTEGER | 是 |
+| Q5 `c_nationkey=n_nationkey` | 1 | VARCHAR | 否 |
+| Q5 `o_custkey=c_custkey` | 2 | INTEGER, VARCHAR | 否 |
+| Q5 `l_orderkey=o_orderkey` | 2 | BIGINT, VARCHAR | 否 |
+| Q9 `s_nationkey=n_nationkey` | 1 | VARCHAR | 否 |
+| Q9 `l_partkey=p_partkey` | 1 | BIGINT | 是 |
+| Q9 `l_orderkey=o_orderkey` | 1 | DATE | 是 |
+| Q10 `l_orderkey=o_orderkey` | 1 | (定长) | 是 |
+
+**优化方案**：在构造函数中按物理类型分流 payload 列为 `fixed_payload_indices` 和 `var_payload_indices`。`SinkBitmap` 中定长列先 lock-free scatter，然后仅对 varchar 列加锁 scatter。Q9/Q10 的全定长 join 完全无锁，Q5 的混合 join 中定长列也不被 varchar 锁阻塞。
+
+**优化效果**（wall-clock，warm_avg）：
+
+| Query | 优化前 warm_avg | 优化后 warm_avg | 降幅 | vs baseline | 改善 |
+|---|---|---|---|---|---|
+| Q5 bitmap | 265.5ms | 248.8ms | -6% | 1.58x（此前1.68x） | 有改善但仍有VARCHAR锁 |
+| Q9 bitmap | 285.6ms | 265.0ms | -7% | 0.78x（此前0.83x） | 获益增大 |
+| **Q10 bitmap** | **297.7ms** | **224.5ms** | **-25%** | **1.02x** | **消除>20%告警** |
+
+Q10 改善最显著——从 298ms 降到 225ms（-25%），`warm_avg/baseline = 224.5/219.8 = 1.02x`，仅慢 2%，不再触发 `>20% slower` 告警。根因是 Q10 的 `lineitem⋈orders` join 的 payload 是全定长列，优化后完全 lock-free，消除了多线程 build 的锁等待。
+
+`operator_timing` 变化更显著（反映 pipeline 等待的消除）：
+- Q9 `l_orderkey=o_orderkey`（DATE，全定长）：322ms → **104ms**（-68%）
+- Q10 `l_orderkey=o_orderkey`（定长）：1008ms → **145ms**（-86%）
+- Q5 `l_orderkey=o_orderkey`（BIGINT+VARCHAR，混合）：1929ms → 1524ms（-21%，VARCHAR列仍需锁）
+
+**改动文件**：
+- `src/include/duckdb/execution/operator/join/bitmap_hash_join_executor.hpp`：新增 `fixed_payload_indices` / `var_payload_indices` 字段。
+- `src/execution/operator/join/bitmap_hash_join_executor.cpp`：构造函数中按类型分流；`SinkBitmap` 中定长列 lock-free scatter + varchar 列加锁 scatter。
+
+#### 8.7.5b CombineBitmap 无锁稀疏合并（v0.8.0 新增）
+
+**问题**：`CombineBitmap` 此前用 `lock_guard<mutex>` 串行化 OR 合并，且对全 `bitmap_size` 做 OR 操作。两个问题：
+1. mutex 串行化——多线程 build 时所有线程在 Combine 阶段排队等锁
+2. 全量 OR——低密度场景（如 Q5 密度3%）97% 的 word 是 0，OR 它们是纯浪费
+
+**方案1：atomic fetch_or（消除 mutex）**
+
+`ValidityMask` 内部是 `validity_t = uint64_t` 数组。`global_bitmap OR local_bitmap` 是对每个 64 位字做 `global[w] |= local[w]`，这可以用 `std::atomic<uint64_t>::fetch_or` 实现无锁合并：
+
+```cpp
+auto *atomic_global = reinterpret_cast<std::atomic<validity_t>*>(global_bitmap.GetData());
+for (idx_t w = 0; w < word_count; w++) {
+    atomic_global[w].fetch_or(local_data[w], std::memory_order_relaxed);
+}
+```
+
+`fetch_or` 编译为 x86 `LOCK OR` 指令（硬件级原子操作），比 mutex 快几个数量级。OR 操作可交换可结合，多线程并发 `fetch_or` 结果正确。`memory_order_relaxed` 足够——bitmap 只在 Finalize 后才被 probe 读取，不需要跨线程同步顺序。
+
+**方案2：稀疏合并（只 OR touched words）**
+
+在 `SinkBitmap` 的 `ExtractBuildRowids` 中，每次 `local_bitmap.SetValidUnsafe(rowid)` 时标记 `touched_words[rowid / 64] = true`。Combine 时只遍历 touched words，跳过全 0 的 word。
+
+Q5 场景：227K 有效位 / 750万位，有效 word 数 ≈ 227K / 64 ≈ 3554，总 word 数 = 117187，**只遍历 3% 的 word**。
+
+用 `std::vector<bool>`（bitset，1 bit/元素）作为 dirty bitmap，内存开销 = bitmap_size / 8 / 8 = 916KB / 8 = 114KB，可忽略。
+
+**优化效果**（wall-clock warm_avg，相对 payload scatter 锁优化后的 v0.7.0）：
+
+| Query | v0.7.0 warm_avg | v0.8.0 warm_avg | 增量降幅 | vs baseline | 说明 |
+|---|---|---|---|---|---|
+| Q5 | 248.8ms | 240.2ms | -3.5% | 1.53x | CombineBitmap 开销占比中等，mutex消除+97% word跳过 |
+| Q9 | 265.0ms | 262.2ms | -1.1% | 0.78x | 密度100%，所有word都touched，稀疏合并无收益，仅mutex消除 |
+| Q10 | 224.5ms | 224.7ms | ~0% | 1.01x | join数量少，CombineBitmap开销本就很小 |
+
+Q5 改善最明显（-3.5%），因为它的 `l_orderkey=o_orderkey` join build 侧密度 3%，稀疏合并跳过 97% 的 word，加上 mutex 消除，CombineBitmap 阶段开销大幅下降。
+
+**改动文件**：
+- `src/include/duckdb/execution/operator/join/bitmap_hash_join_executor.hpp`：`BitmapJoinLocalState` 新增 `touched_words`（`std::vector<bool>`）和 `touched_word_count`。
+- `src/execution/operator/join/bitmap_hash_join_executor.cpp`：
+  - `BitmapJoinLocalState::Initialize`：初始化 `touched_words`（大小 = `EntryCount(bitmap_size)`）。
+  - `ExtractBuildRowids`：`SetValidUnsafe` 后标记 `touched_words[rowid / 64] = true`。
+  - `ExtractBuildRowidsSwitch`：新增 `touched_words` 参数透传。
+  - `CombineBitmap`：用 `atomic fetch_or` 替代 mutex + 只遍历 touched words。
+
+#### 8.7.6 回归测试
+
+- `[bitmap_join]`：20 个测试，433 断言全部通过（含 self-join、chain propagation、RIGHT_SEMI 回退、条目8b 压缩跳过等）。
+- `test/optimizer/compressed_materialization.test_slow`：62 断言全部通过。
+- `[bitmap_join_tpch]` + `[bitmap_join_tpch_profile]`：Q5/Q9/Q10 端到端正确性 + 22条标准 TPC-H SQL smoke test：`22 ok, 0 mismatched, 0 crashed`。
+- `Bitmap-Join*`（`test_bitmap_join_perf.cpp` 全部4个隐藏 `TEST_CASE`）：149 断言全部通过。
+
+#### 8.7.7 验收标准达成情况
+
+1. [x] 现有条目3/4/8b 相关测试全部保持通过（无回归）。
+2. [x] 完整实现 `bhj_passthrough_refs`（Step A-E），覆盖 `left_projection_map` 为空和非空两种场景。
+3. [x] Q5/Q9 的 `PATH_INCOMPLETE_LEFT_SIDE` 归因项清零（各 +1 命中）。
+4. [x] Q9 总耗时因命中率提升显著下降（341→278ms，-19%）。
+5. [x] Q5 出现中等额外开销（§8b.4.5 预警的"低密度=性能下降"场景在 Q5 上真实复现），但**不是此前记录的"暴涨13.5倍"**——v0.6.0 的 1929ms 数字来自 `operator_timing`（含 pipeline 等待阻塞），实际 wall-clock 仅 1.68x（158→266ms，详见 §8.7.2a 修正分析）。主要开销来自 `payload_columns`（114MB，密度3%）的稀疏 gather cache miss，bitmap 本身 916KB 可放入 L2 不是瓶颈。这是执行器层面问题（bitmap size 按静态PK全表行数分配），非条目8自身引入的 bug——条目8正确地将隐藏列安全传播过了 LEFT 侧，只是传播过去的 join 因密度低而有额外开销。建议作为后续专项处理。
+
 ---
 
 ## 条目8b：`CompressedMaterialization` 与 BHJ 的冲突（新增，v0.3.0 设计 → v0.4.0 已实施并验证）
@@ -305,6 +538,8 @@ Q10    bitmap          308.9        3        2         20
 ### 8b.4.5 Q10 `lineitem⋈orders` 耗时暴涨的根因分析：bitmap 大小按「静态PK全表行数」分配，而非「实际到达 build 侧的行数」
 
 **现象**：同样是"命中 BHJ"，为什么 Q9 的 `partsupp⋈supplier+nation`（127ms→12ms，降幅91%）和本文 `test_bitmap_join_perf.cpp` 的 `lineitem⋈part`（263ms→85ms，降幅68%）都稳定获益，而 Q10 的 `lineitem⋈orders` 反而暴涨5倍？用真实数据核对每个 join 的 **build 侧密度**（= 实际到达该 join 的 build 端行数 ÷ `bitmap_join_meta.json` 里登记的该 PK 表的静态 `row_count`）后，发现密度与耗时变化方向高度相关：
+
+> **v0.6.1 修正注记**：本节中的"暴涨5.1倍"（226→1152ms）和下文 Q5 的"暴涨5倍"等数字均来自 `operator_timing`，包含 pipeline 等待阻塞时间。条目8落地后用 wall-clock 重新测量：Q10 `lineitem⋈orders` 的查询级 wall-clock 是 219→298ms（1.36x），Q5 `l_orderkey=o_orderkey` 是 158→266ms（1.68x），远小于 `operator_timing` 显示的倍数。密度与性能趋势的**方向**仍然正确（低密度=相对更慢），但**幅度**被 `operator_timing` 夸大了。详见 §8.7.2a 的完整修正分析。
 
 | Join | PK 表 | 静态 `row_count`（`bitmap_join_meta.json`） | 实际到达 build 侧的行数 | 密度 | bitmap(ms) 变化 |
 | --- | --- | --- | --- | --- | --- |

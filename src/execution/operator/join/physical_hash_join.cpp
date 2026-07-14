@@ -386,10 +386,12 @@ SinkResultType PhysicalHashJoin::Sink(ExecutionContext &context, DataChunk &chun
 	if (payload_columns.col_types.empty()) { // there are only keys: place an empty chunk in the payload
 		lstate.payload_chunk.SetCardinality(chunk.size());
 	} else { // there are payload columns
+		// 这里仅仅reference
 		lstate.payload_chunk.ReferenceColumns(chunk, payload_columns.col_idxs);
 	}
 
 	// build the HT
+	// 这里也是把paryload reference到sourcechunk中
 	lstate.hash_table->Build(lstate.append_state, lstate.join_keys, lstate.payload_chunk);
 
 	return SinkResultType::NEED_MORE_INPUT;
@@ -1145,8 +1147,16 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 	if (sink.perfect_join_executor) {
 		D_ASSERT(!sink.external);
 		state.lhs_output.ReferenceColumns(input, lhs_output_columns.col_idxs);
-		return sink.perfect_join_executor->ProbePerfectHashTable(context, input, state.lhs_output, chunk,
-		                                                         *state.perfect_hash_join_state);
+		auto ret = sink.perfect_join_executor->ProbePerfectHashTable(context, input, state.lhs_output, chunk,
+		                                                             *state.perfect_hash_join_state);
+		// 条目8: append passthrough columns after the perfect hash join output too.
+		if (!passthrough_lhs_col_idxs.empty() && chunk.size() > 0) {
+			idx_t passthrough_start = lhs_output_columns.col_idxs.size() + rhs_output_columns.col_idxs.size();
+			for (idx_t i = 0; i < passthrough_lhs_col_idxs.size(); i++) {
+				chunk.data[passthrough_start + i].Reference(input.data[passthrough_lhs_col_idxs[i]]);
+			}
+		}
+		return ret;
 	}
 
 	if (sink.external && !state.initialized) {
@@ -1175,6 +1185,18 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 
 	state.lhs_output.ReferenceColumns(input, lhs_output_columns.col_idxs);
 	state.scan_structure.Next(state.lhs_join_keys, state.lhs_output, chunk);
+
+	// 条目8 (b_idea/6.4遗漏问题 任务2): append passthrough columns from the probe input after
+	// the normal [lhs_output][rhs_output] columns. These are hidden columns (_rowid/*_ref) that
+	// bypass the join's [left][right] layout and are appended at the end. They come from the
+	// LHS (probe) input and must be sliced to match the matched rows in the output.
+	if (!passthrough_lhs_col_idxs.empty() && chunk.size() > 0) {
+		idx_t passthrough_start = lhs_output_columns.col_idxs.size() + rhs_output_columns.col_idxs.size();
+		for (idx_t i = 0; i < passthrough_lhs_col_idxs.size(); i++) {
+			chunk.data[passthrough_start + i].Slice(
+			    input.data[passthrough_lhs_col_idxs[i]], state.scan_structure.lhs_sel_vector, chunk.size());
+		}
+	}
 
 	if (state.scan_structure.PointersExhausted() && chunk.size() == 0) {
 		state.scan_structure.is_null = true;
