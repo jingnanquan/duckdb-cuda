@@ -18,7 +18,9 @@
 
 #include <atomic>
 #include "duckdb/common/mutex.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/validity_mask.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/execution/execution_context.hpp"
@@ -28,16 +30,31 @@ namespace duckdb {
 
 class PhysicalHashJoin;
 
+enum class BitmapJoinPayloadMode : uint8_t { DENSE_ROWID, COMPACT_ROWID_RANK };
+
 //! Per-thread build state, held inside HashJoinLocalSinkState. Each build thread
 //! accumulates set rowids into its own bitmap with no synchronization
 //! (SetValidUnsafe); the thread-local bitmaps are OR-merged in CombineBitmap.
 struct BitmapJoinLocalState {
 	//! Allocate the thread-local bitmap (all-invalid) lazily. Safe to call repeatedly.
 	void Initialize(idx_t bitmap_size);
+	//! Reuse per-chunk build scratch buffers instead of allocating them for every SinkBitmap call.
+	void EnsureScratch(idx_t count);
+	//! Initialize per-thread compact build collection used by sparse/compact payload mode.
+	void InitializeCompact(ClientContext &context, const vector<LogicalType> &types);
 
 	//! all-invalid mask sized to the PK table row count; bit i == 1 means build row i passed.
 	ValidityMask bitmap;
 	bool initialized = false;
+
+	SelectionVector valid_rows;
+	vector<idx_t> rowids;
+	idx_t scratch_capacity = 0;
+
+	unique_ptr<ColumnDataCollection> compact_collection;
+	ColumnDataAppendState compact_append_state;
+	DataChunk compact_append_chunk;
+	bool compact_initialized = false;
 
 	//! perf/sf5/combine锁 优化: 本线程累计的有效 build 行数 (跨该线程处理过的所有 chunk 累加)。
 	//! CombineBitmap 时汇总到 BitmapJoinExecutor::total_valid_count，用来在 FinalizeBitmap 里
@@ -83,6 +100,19 @@ public:
 	bool IsReady() const {
 		return ready;
 	}
+	const char *PayloadModeString() const;
+
+private:
+	void InitializePayloadColumns(idx_t alloc_size);
+	void InitializeCompactTypes();
+	bool ShouldUseCompactPayload() const;
+	void SinkBitmapDense(DataChunk &chunk, DataChunk &build_keys, BitmapJoinLocalState &lstate);
+	void SinkBitmapCompact(ExecutionContext &context, DataChunk &chunk, DataChunk &build_keys,
+	                       BitmapJoinLocalState &lstate);
+	void CombineBitmapDense(BitmapJoinLocalState &lstate);
+	void CombineBitmapCompact(BitmapJoinLocalState &lstate);
+	void FinalizeCompactPayload();
+	idx_t RowidToCompactIndex(idx_t rowid) const;
 
 private:
 	const PhysicalHashJoin &join;
@@ -92,20 +122,29 @@ private:
 	//! rowid = pk_value - build_rowid_offset (1-based PK columns reuse rowid_offset == 1).
 	int64_t build_rowid_offset = 0;
 
+	BitmapJoinPayloadMode payload_mode = BitmapJoinPayloadMode::DENSE_ROWID;
+
 	//! Union of all build-side rowids (filled during build).
 	ValidityMask global_bitmap;
-	//! Materialized RHS output columns, each sized to bitmap_size and indexed by rowid.
+	//! Materialized RHS output columns; dense mode indexes by rowid, compact mode indexes by bitmap-rank payload id.
 	vector<unique_ptr<Vector>> payload_columns;
 	//! For each RHS output column i, the source column index within the build chunk.
 	vector<idx_t> payload_source_columns;
+
+	//! Compact mode collection schema: [rowid][rhs output columns...].
+	vector<LogicalType> compact_collection_types;
+	unique_ptr<ColumnDataCollection> compact_build_collection;
+	mutex compact_collection_lock;
+	vector<idx_t> compact_word_base;
+	idx_t compact_payload_count = 0;
 
 	//! 条目8: payload 列按物理类型分流。定长列 scatter 写不同 rowid 位置，lock-free 安全；
 	//! 变长列(VARCHAR) scatter 需操作 StringHeap，必须加锁。分流后定长列不被 varchar 锁阻塞。
 	vector<idx_t> fixed_payload_indices;
 	vector<idx_t> var_payload_indices;
+	//! One lock per variable-width payload column to avoid serializing independent StringHeaps.
+	vector<unique_ptr<mutex>> var_payload_locks;
 
-	//! Guards global_bitmap OR-merge and payload scatter (build side is the small side).
-	mutex build_lock;
 	bool ready = false;
 	//! 5.1 (perf/sf5/combine锁 / 根因分析-详细版.md §5.1): 稠密 fast-path 标志。
 	//! FinalizeBitmap 时若 bitmap 全部置位 (popcount == bitmap_size) 则置 true，

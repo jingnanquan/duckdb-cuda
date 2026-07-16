@@ -252,9 +252,9 @@ public:
 		join_keys.Initialize(allocator, op.condition_types);
 
 		if (gstate.use_bitmap_join) {
-			// BHJ build (module 6.4): allocate the thread-local bitmap; no hash table / payload chunk.
+			// BHJ build (module 6.4): no hash table / payload chunk. The thread-local bitmap is
+			// allocated lazily on the first SinkBitmap call so idle local states do not reserve B/8 bytes.
 			// join_key_executor (over cond.right) yields the build-side rowid key for SinkBitmap.
-			bitmap_local.Initialize(gstate.bitmap_join_executor->BitmapSize());  //这里是全局的bitmap
 			gstate.active_local_states++;
 			return;
 		}
@@ -1702,6 +1702,12 @@ InsertionOrderPreservingMap<string> PhysicalHashJoin::ParamsToString() const {
 
 	if (use_bitmap_join) {
 		result["Bitmap Join"] = "yes";
+		if (sink_state) {
+			auto &sink = sink_state->Cast<HashJoinGlobalSinkState>();
+			if (sink.bitmap_join_executor) {
+				result["Bitmap Payload"] = sink.bitmap_join_executor->PayloadModeString();
+			}
+		}
 	} else if (bhj_skip_reason != BitmapJoinSkipReason::NOT_PROCESSED &&
 	           bhj_skip_reason != BitmapJoinSkipReason::HIT) {
 		// 条目6 (b_idea/6.4遗漏问题): purely diagnostic - shows why BitmapJoinResolver didn't

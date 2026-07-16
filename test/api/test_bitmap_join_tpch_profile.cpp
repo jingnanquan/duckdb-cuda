@@ -174,7 +174,8 @@ string JoinNames(const std::vector<string> &v) {
 struct JoinTiming {
 	string label; //! "<condition> [<probe-side tables> <-> <build-side tables>]"
 	double timing_s = 0.0;
-	string bitmap_join = "(none)"; //! ParamsToString's "Bitmap Join" extra_info value, if any.
+	string bitmap_join = "(none)";    //! ParamsToString's "Bitmap Join" extra_info value, if any.
+	string bitmap_payload = "(none)"; //! BitmapJoinExecutor payload mode: dense/compact, if any.
 };
 
 void WalkHashJoins(yyjson_val *node, std::vector<JoinTiming> &out) {
@@ -202,6 +203,13 @@ void WalkHashJoins(yyjson_val *node, std::vector<JoinTiming> &out) {
 				auto s = SafeStr(bj);
 				if (!s.empty()) {
 					jt.bitmap_join = s;
+				}
+			}
+			auto bp = yyjson_obj_get(extra, "Bitmap Payload");
+			if (bp) {
+				auto s = SafeStr(bp);
+				if (!s.empty()) {
+					jt.bitmap_payload = s;
 				}
 			}
 		}
@@ -260,8 +268,8 @@ void RunAndReport(Connection &con, const string &name, const string &sql, std::o
 	auto bitmap = RunWithProfiling(con, sql, tmp_dir + "/" + name + "_bitmap.json", false, true);
 
 	printf("\n=== %s ===\n", name.c_str());
-	printf("%-70s %12s %12s %12s %10s\n", "Join (condition [probe <-> build])", "baseline(ms)", "perfect(ms)",
-	       "bitmap(ms)", "BHJ?");
+	printf("%-70s %12s %12s %12s %10s %10s\n", "Join (condition [probe <-> build])", "baseline(ms)",
+	       "perfect(ms)", "bitmap(ms)", "BHJ?", "payload");
 	size_t n = std::max({baseline.size(), perfect.size(), bitmap.size()});
 	for (size_t i = 0; i < n; i++) {
 		string label = i < bitmap.size() ? bitmap[i].label : (i < baseline.size() ? baseline[i].label : "?");
@@ -269,8 +277,11 @@ void RunAndReport(Connection &con, const string &name, const string &sql, std::o
 		double p = i < perfect.size() ? perfect[i].timing_s * 1000.0 : -1;
 		double m = i < bitmap.size() ? bitmap[i].timing_s * 1000.0 : -1;
 		string bj = i < bitmap.size() ? bitmap[i].bitmap_join : "?";
-		printf("%-70s %12.3f %12.3f %12.3f %10s\n", label.c_str(), b, p, m, bj.c_str());
-		csv << name << ",\"" << label << "\"," << b << "," << p << "," << m << ",\"" << bj << "\"\n";
+		string bp = i < bitmap.size() ? bitmap[i].bitmap_payload : "?";
+		printf("%-70s %12.3f %12.3f %12.3f %10s %10s\n", label.c_str(), b, p, m, bj.c_str(),
+		       bp.c_str());
+		csv << name << ",\"" << label << "\"," << b << "," << p << "," << m << ",\"" << bj << "\",\""
+		    << bp << "\"\n";
 	}
 }
 
@@ -307,7 +318,7 @@ TEST_CASE("BHJ operator-level timing across baseline/perfect/bitmap for TPC-H qu
 	const string csv_dir = "/data/workspace/database/duckdb-cuda/b_idea/perf/sf5";
 	fs->CreateDirectoriesRecursive(csv_dir);
 	std::ofstream csv(csv_dir + "/tpch_operator_timing.csv", std::ios::out | std::ios::trunc);
-	csv << "query,join_label,baseline_ms,perfect_ms,bitmap_ms,bitmap_join_status\n";
+	csv << "query,join_label,baseline_ms,perfect_ms,bitmap_ms,bitmap_join_status,bitmap_payload_mode\n";
 
 	auto query_ids = GetQueryIds();
 	printf("Running TPC-H queries: ");
