@@ -3,20 +3,23 @@
 // TPC-H e2e 计时 harness —— 通过 DuckDB C API 链接 libduckdb.so 执行。
 //
 // 设计要点 (解决旧脚本的两大问题):
-//   1) 冷启动: 全部 22 条查询都在 *同一个进程 / 同一个 connection* 内执行,
-//      只有进程启动时加载一次 .so, 每条查询不再 fork subprocess。
-//      因此 avg 反映的是查询本身的开销, 而非 Python/subprocess 调度开销。
-//   2) 计时精度: 用 std::chrono::steady_clock 紧贴 conn.Query()+Materialize(),
-//      排除 CLI 初始化/打印/进程退出等噪声, 比 "wall-clock around subprocess" 精确得多。
+//   1) 冷启动: 整个 benchmark 只启动一个进程、只加载一次 .so, 但 *每条查询*
+//      都在循环内新建独立的 DuckDB 实例 / 独立 connection 执行, 并从空
+//      buffer pool 起步。这样既避免了 fork subprocess 的调度开销, 又消除了
+//      跨查询缓存污染与内存淘汰对单条查询计时的干扰 (OS page cache 仍共享)。
+//   2) 计时精度: 用 std::chrono::steady_clock 紧贴 duckdb_query() (C API 已
+//      完整物化结果), 排除 CLI 初始化/打印/进程退出等噪声, 比 "wall-clock
+//      around subprocess" 精确得多。
 //
-// 官方版与 bitmap 版使用 *同一个* 二进制, 仅通过 LD_LIBRARY_PATH 决定加载哪个
-// libduckdb.so, 并通过 --bitmap 决定是否下发 bitmap_join_load / open_bitmap_join。
-// 这样两遍在同一机器、同一进程模型下测量, 偏差可控。
+// official_baseline / project_baseline / project_bitmap 使用 *同一个* 二进制,
+// 仅通过 LD_LIBRARY_PATH 决定加载哪个 libduckdb.so, 并通过 --bitmap 决定
+// 是否下发 bitmap_join_load / open_bitmap_join。这样三遍在同一机器、同一
+// 进程模型下测量, 偏差可控。
 //
 // 用法:
 //   LD_LIBRARY_PATH=<dir-with-libduckdb.so> ./tpch_bench_harness \
 //       --queries queries_run.sql --data-dir <parquet dir> \
-//       [--meta bitmap_join_meta.json] [--bitmap] \
+//       [--meta bitmap_join_meta.json] [--bitmap] [--set-bitmap-off] \
 //       [--warmup 1] [--runs 3]
 //
 // 查询文件格式 (由 Python 驱动拼接): 以单独一行 "--QUERY Qnn" 作为分隔符,
@@ -45,6 +48,7 @@ struct Config {
     std::string data_dir;
     std::string meta;       // 仅 bitmap 模式使用
     bool bitmap = false;
+    bool set_bitmap_off = false;  // 仅项目 baseline 使用，官方 lib 无此配置项
     int warmup = 1;
     int runs = 3;
 };
@@ -112,7 +116,7 @@ struct DB {
     duckdb_database db = nullptr;
     duckdb_connection con = nullptr;
 
-    void open(bool bitmap, const std::string &data_dir, const std::string &meta) {
+    void open(bool bitmap, bool set_bitmap_off, const std::string &data_dir, const std::string &meta) {
         if (duckdb_open(nullptr, &db) != DuckDBSuccess)
             die("duckdb_open failed");
         if (duckdb_connect(db, &con) != DuckDBSuccess)
@@ -139,8 +143,11 @@ struct DB {
             exec(load.c_str());
             exec("SET open_bitmap_join=true;");
             fprintf(stderr, "[harness] bitmap 模式已启用 (meta=%s)\n", meta.c_str());
+        } else if (set_bitmap_off) {
+            exec("SET open_bitmap_join=false;");
+            fprintf(stderr, "[harness] project baseline 模式 (open_bitmap_join=false)\n");
         } else {
-            fprintf(stderr, "[harness] 官方模式 (无 bitmap join)\n");
+            fprintf(stderr, "[harness] official baseline 模式 (不设置 open_bitmap_join)\n");
         }
     }
 
@@ -184,7 +191,7 @@ struct DB {
 void usage() {
     fprintf(stderr,
             "usage: tpch_bench_harness --queries f.sql --data-dir D "
-            "[--meta m.json] [--bitmap] [--warmup N] [--runs N]\n");
+            "[--meta m.json] [--bitmap] [--set-bitmap-off] [--warmup N] [--runs N]\n");
 }
 
 }  // namespace
@@ -201,6 +208,7 @@ int main(int argc, char **argv) {
         else if (a == "--data-dir") cfg.data_dir = need("--data-dir");
         else if (a == "--meta") cfg.meta = need("--meta");
         else if (a == "--bitmap") cfg.bitmap = true;
+        else if (a == "--set-bitmap-off") cfg.set_bitmap_off = true;
         else if (a == "--warmup") cfg.warmup = std::atoi(need("--warmup").c_str());
         else if (a == "--runs") cfg.runs = std::atoi(need("--runs").c_str());
         else { usage(); die("unknown arg: " + a); }
@@ -215,17 +223,20 @@ int main(int argc, char **argv) {
     auto queries = parse_queries(content);
     fprintf(stderr, "[harness] 解析到 %zu 条查询\n", queries.size());
 
-    // 打开 DB (单进程 / 单连接)
-    DB db;
-    db.open(cfg.bitmap, cfg.data_dir, cfg.meta);
-
     // 执行
+    // 每条查询在循环内新建独立 DB 实例, 从空 buffer pool 起步,
+    // 循环结束 (db 析构) 时 disconnect/close 释放该查询的 buffer pool,
+    // 从而消除跨查询缓存污染与内存淘汰干扰。
     std::map<std::string, std::map<std::string, std::string>> results;
     for (auto &kv : queries) {
         const std::string &name = kv.first;
         const std::string &sql = kv.second;
 
-        // warmup (仅预热, 不计入均值)
+        // 每条查询独立实例 / 独立 connection / 独立 buffer manager
+        DB db;
+        db.open(cfg.bitmap, cfg.set_bitmap_off, cfg.data_dir, cfg.meta);
+
+        // warmup (仅预热, 不计入均值, 在本查询自己的 buffer pool 内)
         double w = 0.0;
         idx_t wrows = 0;
         for (int i = 0; i < cfg.warmup; ++i) {

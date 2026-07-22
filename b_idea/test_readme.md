@@ -43,6 +43,7 @@ duckdb_extension_load(tpcds)
 ```bash
 cd /home/featurize/workspace/duckdb-cuda
 make release -j"$(nproc)"
+CMAKE_BUILD_PARALLEL_LEVEL=96 make release
 ```
 
 产出：
@@ -143,8 +144,9 @@ cd /home/featurize/workspace/duckdb-cuda
 以下测试都依赖第 2/3 步生成的 `data/tpch_sf5/` 和 `data/tpch_sf5_bitmap/`；数据集不存在时会打印一行提示并静默跳过（不会 FAIL），因此**必须先完成第 2/3 步**才能真正跑到断言。这些测试都打了 Catch2 的隐藏 tag `[.]`（多 GB 外部数据集 + 相对慢），需要显式指定测试名才会被跑，不在日常 `./unittest "*"` 全量跑批里。
 
 ```bash
-# Q5/Q9/Q10 端到端正确性 + 命中率/耗时软性打印 + 原始数据交叉验证
+# Q5/Q9/Q10 端到端正确性 + 命中率/耗时软性打印 + 原始数据交叉验证，可指定具体query查询
 ./build/release/test/unittest "[bitmap_join_tpch]"
+BHJ_QUERIES=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22 ./build/release/test/unittest "[bitmap_join_tpch]"
 
 # 算子级(HASH_JOIN)耗时画像(baseline/perfect/bitmap三模式对比) + 22条标准TPCH SQL全量smoke test
 ./build/release/test/unittest "[bitmap_join_tpch_profile]"
@@ -167,6 +169,14 @@ cd /home/featurize/workspace/duckdb-cuda
 ./build/release/test/unittest "*bitmap*"
 ```
 
+---
+
+### 4.4 实验测试
+
+```bash
+bash b_idea/perf/tpche2e/build_harness.sh
+python3 b_idea/perf/tpche2e/tpche2e_bench_sdk.py
+```
 ---
 
 ## 5. 常见问题
