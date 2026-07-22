@@ -32,7 +32,7 @@ using namespace std;
 
 namespace {
 
-constexpr const char *kBitmapDataDir = "/data/workspace/database/duckdb-cuda/data/tpch_sf5_bitmap";
+constexpr const char *kBitmapDataDir = "/home/featurize/workspace/duckdb-cuda/data/tpch_sf5_bitmap";
 constexpr const char *kTables[] = {"region",  "nation",   "customer", "orders",
                                    "part",    "partsupp", "supplier", "lineitem"};
 

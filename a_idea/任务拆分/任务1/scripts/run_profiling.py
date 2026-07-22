@@ -6,7 +6,7 @@
 并生成 matplotlib 时序图。
 
 用法:
-    cd /data/workspace/database/duckdb-cuda
+    cd /home/featurize/workspace/duckdb-cuda
     python3 a_idea/任务拆分/任务1/scripts/run_profiling.py
 
 依赖:
@@ -28,7 +28,7 @@ from highres_monitor import HighResMonitor, monitor_query_execution
 # ============================================================
 # 配置
 # ============================================================
-BASE_DIR = "/data/workspace/database/duckdb-cuda"
+BASE_DIR = "/home/featurize/workspace/duckdb-cuda"
 DUCKDB_BIN = f"{BASE_DIR}/build/release/duckdb"
 TPCH_DATA_DIR = f"{BASE_DIR}/data/tpch_sf5"
 TPCDS_DATA_DIR = f"{BASE_DIR}/data/tpcds_sf5"

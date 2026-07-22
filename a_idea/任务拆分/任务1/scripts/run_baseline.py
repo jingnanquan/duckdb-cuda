@@ -4,7 +4,7 @@
 产出 CSV 格式的基线报告。
 
 用法:
-    cd /data/workspace/database/duckdb-cuda
+    cd /home/featurize/workspace/duckdb-cuda
     python3 a_idea/任务拆分/任务1/scripts/run_baseline.py
 """
 
@@ -18,7 +18,7 @@ import statistics
 # ============================================================
 # 配置
 # ============================================================
-BASE_DIR = "/data/workspace/database/duckdb-cuda"
+BASE_DIR = "/home/featurize/workspace/duckdb-cuda"
 DUCKDB_BIN = f"{BASE_DIR}/build/release/duckdb"
 TPCH_DATA_DIR = f"{BASE_DIR}/data/tpch_sf5"
 TPCDS_DATA_DIR = f"{BASE_DIR}/data/tpcds_sf5"

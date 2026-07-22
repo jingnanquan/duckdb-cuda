@@ -19,7 +19,7 @@
 // printed as diagnostics only (see design doc §5.3: "软性打印，不作为CI失败条件").
 //
 // The SF=5 parquet files (and bitmap_join_meta.json) live at:
-//   /data/workspace/database/duckdb-cuda/data/tpch_sf5_bitmap/
+//   /home/featurize/workspace/duckdb-cuda/data/tpch_sf5_bitmap/
 // If that directory (or its 8 tables) is not present, the test is skipped. Hidden behind the
 // `[.]` tag (like test_bitmap_join_perf.cpp) since it depends on that multi-GB external dataset
 // and is comparatively slow - run explicitly with `./unittest "[bitmap_join_tpch]"`.
@@ -47,8 +47,8 @@ using namespace std;
 
 namespace {
 
-constexpr const char *kBitmapDataDir = "/data/workspace/database/duckdb-cuda/data/tpch_sf5_bitmap";
-constexpr const char *kRawDataDir = "/data/workspace/database/duckdb-cuda/data/tpch_sf5";
+constexpr const char *kBitmapDataDir = "/home/featurize/workspace/duckdb-cuda/data/tpch_sf5_bitmap";
+constexpr const char *kRawDataDir = "/home/featurize/workspace/duckdb-cuda/data/tpch_sf5";
 constexpr const char *kTables[] = {"region",  "nation",   "customer", "orders",
                                    "part",    "partsupp", "supplier", "lineitem"};
 
@@ -312,7 +312,7 @@ TEST_CASE("Bitmap-Join (BHJ) end-to-end TPC-H queries (SF=5 parquet)", "[bitmap_
 	std::ofstream csv;
 	{
 		auto fs = FileSystem::CreateLocal();
-		const string csv_dir = "/data/workspace/database/duckdb-cuda/b_idea/perf/sf5";
+		const string csv_dir = "/home/featurize/workspace/duckdb-cuda/b_idea/perf/sf5";
 		fs->CreateDirectoriesRecursive(csv_dir);
 		csv.open(csv_dir + "/tpch_q5_q9_q10.csv", std::ios::out | std::ios::trunc);
 		csv << "query,mode,hash_join_count,bhj_hits,rows_out,cold_ms,warm_avg_ms,warm_min_ms,warm_max_ms\n";

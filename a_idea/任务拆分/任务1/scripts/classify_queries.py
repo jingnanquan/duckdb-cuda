@@ -4,7 +4,7 @@
 根据 EXPLAIN 输出分析每条查询的类型：Scan-bound / Hash join 重叠 / 同表多次扫描
 
 用法:
-    cd /data/workspace/database/duckdb-cuda
+    cd /home/featurize/workspace/duckdb-cuda
     python3 a_idea/任务拆分/任务1/scripts/classify_queries.py
 """
 
@@ -17,7 +17,7 @@ import sys
 # ============================================================
 # 配置
 # ============================================================
-BASE_DIR = "/data/workspace/database/duckdb-cuda"
+BASE_DIR = "/home/featurize/workspace/duckdb-cuda"
 DUCKDB_BIN = f"{BASE_DIR}/build/release/duckdb"
 TPCH_DATA_DIR = f"{BASE_DIR}/data/tpch_sf5"
 TPCDS_DATA_DIR = f"{BASE_DIR}/data/tpcds_sf5"

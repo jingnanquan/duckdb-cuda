@@ -41,7 +41,7 @@ duckdb_extension_load(tpcds)
 **方式 A：Release（推荐，跑 SF5 数据集测试更快）**
 
 ```bash
-cd /data/workspace/database/duckdb-cuda
+cd /home/featurize/workspace/duckdb-cuda
 make release -j"$(nproc)"
 ```
 
@@ -52,7 +52,7 @@ make release -j"$(nproc)"
 **方式 B：Debug（`make unittest`/`make unit` 走的默认路径）**
 
 ```bash
-cd /data/workspace/database/duckdb-cuda
+cd /home/featurize/workspace/duckdb-cuda
 make unittest -j"$(nproc)"   # 等价于 make debug 然后自动跑一次全量测试
 ```
 
@@ -82,12 +82,12 @@ make debug -j"$(nproc)"
 用刚编译好的 `duckdb` CLI（必须是已加载 `tpch` 扩展的这份二进制）跑数据生成 SQL：
 
 ```bash
-cd /data/workspace/database/duckdb-cuda
+cd /home/featurize/workspace/duckdb-cuda
 mkdir -p data/tpch_sf5
 ./build/release/duckdb <<'EOF'
 LOAD tpch;
 CALL dbgen(sf=5);
-EXPORT DATABASE '/data/workspace/database/duckdb-cuda/data/tpch_sf5/' (FORMAT PARQUET);
+EXPORT DATABASE '/home/featurize/workspace/duckdb-cuda/data/tpch_sf5/' (FORMAT PARQUET);
 EOF
 ```
 
@@ -102,7 +102,7 @@ EOF
 用 `b_idea/scripts/add_bitmap_columns.py` 把上一步生成的原始 parquet，转换成 BHJ 需要的"追加隐藏列"版本，输出到独立目录 `data/tpch_sf5_bitmap/`（不修改/覆盖原始数据）：
 
 ```bash
-cd /data/workspace/database/duckdb-cuda
+cd /home/featurize/workspace/duckdb-cuda
 python3 b_idea/scripts/add_bitmap_columns.py \
     --input       data/tpch_sf5/ \
     --output      data/tpch_sf5_bitmap/ \
@@ -132,7 +132,7 @@ python3 b_idea/scripts/test_add_bitmap_columns.py
 ### 4.1 不依赖外部数据集的测试（合成小数据，运行快）
 
 ```bash
-cd /data/workspace/database/duckdb-cuda
+cd /home/featurize/workspace/duckdb-cuda
 ./build/release/test/unittest "[bitmap_join]"
 ```
 

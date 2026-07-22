@@ -7,7 +7,7 @@
 4. 探索 PhysicalPlan 序列化的可行性
 
 用法:
-    cd /data/workspace/database/duckdb-cuda
+    cd /home/featurize/workspace/duckdb-cuda
     python3 a_idea/任务拆分/任务1/scripts/plan_export_inject.py
 """
 
@@ -22,7 +22,7 @@ import re
 # ============================================================
 # 配置
 # ============================================================
-BASE_DIR = "/data/workspace/database/duckdb-cuda"
+BASE_DIR = "/home/featurize/workspace/duckdb-cuda"
 DUCKDB_BIN = f"{BASE_DIR}/build/release/duckdb"
 TPCH_DATA_DIR = f"{BASE_DIR}/data/tpch_sf5"
 TPCDS_DATA_DIR = f"{BASE_DIR}/data/tpcds_sf5"

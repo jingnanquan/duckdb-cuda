@@ -4,7 +4,7 @@
 # 按顺序执行 1.3 ~ 1.6 的所有子任务
 #
 # 用法:
-#   cd /data/workspace/database/duckdb-cuda
+#   cd /home/featurize/workspace/duckdb-cuda
 #   bash a_idea/任务拆分/任务1/scripts/run_all.sh
 #
 # 或者分步执行:
@@ -16,7 +16,7 @@
 
 set -e
 
-BASE_DIR="/data/workspace/database/duckdb-cuda"
+BASE_DIR="/home/featurize/workspace/duckdb-cuda"
 TASK_DIR="${BASE_DIR}/a_idea/任务拆分/任务1"
 SCRIPTS_DIR="${TASK_DIR}/scripts"
 RESULTS_DIR="${TASK_DIR}/results"

@@ -25,7 +25,7 @@ tpche2e_bench_sdk.py — 基于 DuckDB C SDK 的 TPC-H 22 查询端到端 (e2e) 
   - tpche2e_chart.png / tpche2e_speedup.png
 
 用法:
-  cd /data/workspace/database/duckdb-cuda
+  cd /home/featurize/workspace/duckdb-cuda
   bash b_idea/perf/tpche2e/build_harness.sh          # 先编译 harness
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk.py
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk.py --official-only
@@ -46,7 +46,7 @@ import zipfile
 # ============================================================
 # 路径配置
 # ============================================================
-BASE_DIR = "/data/workspace/database/duckdb-cuda"
+BASE_DIR = "/home/featurize/workspace/duckdb-cuda"
 DATA_DIR = os.path.join(BASE_DIR, "data", "tpch_sf5_bitmap")
 META_PATH = os.path.join(DATA_DIR, "bitmap_join_meta.json")
 PROJECT_LIB = os.path.join(BASE_DIR, "build", "release", "src", "libduckdb.so")

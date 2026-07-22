@@ -15,7 +15,7 @@ tpche2e_bench_bitmap_only.py — 只测试 bitmap, official 数据固定采用 t
   - tpche2e_speedup.png          加速比图
 
 用法示例:
-  cd /data/workspace/database/duckdb-cuda
+  cd /home/featurize/workspace/duckdb-cuda
   python3 b_idea/perf/tpche2e/tpche2e_bench_bitmap_only.py
   python3 b_idea/perf/tpche2e/tpche2e_bench_bitmap_only.py --runs 5
   python3 b_idea/perf/tpche2e/tpche2e_bench_bitmap_only.py --queries 1,6,9,18
@@ -33,7 +33,7 @@ import time
 # ============================================================
 # 路径 / 版本配置
 # ============================================================
-BASE_DIR = "/data/workspace/database/duckdb-cuda"
+BASE_DIR = "/home/featurize/workspace/duckdb-cuda"
 DATA_DIR = os.path.join(BASE_DIR, "data", "tpch_sf5_bitmap")
 META_PATH = os.path.join(DATA_DIR, "bitmap_join_meta.json")
 PROJECT_CLI = os.path.join(BASE_DIR, "build", "release", "duckdb")

@@ -9,7 +9,7 @@
 // and the result rows are required to match exactly across paths.
 //
 // The SF=5 parquet files (and the bitmap_join_meta.json) live at:
-//   /data/workspace/database/duckdb-cuda/data/tpch_sf5_bitmap/
+//   /home/featurize/workspace/duckdb-cuda/data/tpch_sf5_bitmap/
 // If that directory is not present (e.g. CI without the dataset) the test is skipped.
 
 #include "catch.hpp"
@@ -30,7 +30,7 @@ using namespace std;
 
 namespace {
 
-constexpr const char *kDataDir = "/data/workspace/database/duckdb-cuda/data/tpch_sf5_bitmap";
+constexpr const char *kDataDir = "/home/featurize/workspace/duckdb-cuda/data/tpch_sf5_bitmap";
 
 // Build the test query. We deliberately keep it as a single equi-join INNER join with the
 // dimension table on the build side so all three execution paths apply.

@@ -7,7 +7,7 @@
 # 来切换到官方 libduckdb.so (同一二进制, 两种 baseline)。
 set -euo pipefail
 
-BASE_DIR="/data/workspace/database/duckdb-cuda"
+BASE_DIR="/home/featurize/workspace/duckdb-cuda"
 SRC_DIR="$BASE_DIR/b_idea/perf/tpche2e"
 INC_DIR="$BASE_DIR/src/include"
 LIB_DIR="$BASE_DIR/build/release/src"   # 默认链接项目 (bitmap) libduckdb.so

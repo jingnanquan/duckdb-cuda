@@ -39,7 +39,7 @@ using namespace std;
 
 namespace {
 
-constexpr const char *kBitmapDataDir = "/data/workspace/database/duckdb-cuda/data/tpch_sf5_bitmap";
+constexpr const char *kBitmapDataDir = "/home/featurize/workspace/duckdb-cuda/data/tpch_sf5_bitmap";
 constexpr const char *kTables[] = {"region",  "nation",   "customer", "orders",
                                    "part",    "partsupp", "supplier", "lineitem"};
 
@@ -315,7 +315,7 @@ TEST_CASE("BHJ operator-level timing across baseline/perfect/bitmap for TPC-H qu
 	registry.LoadFromJson(meta_path);
 
 	auto fs = FileSystem::CreateLocal();
-	const string csv_dir = "/data/workspace/database/duckdb-cuda/b_idea/perf/sf5";
+	const string csv_dir = "/home/featurize/workspace/duckdb-cuda/b_idea/perf/sf5";
 	fs->CreateDirectoriesRecursive(csv_dir);
 	std::ofstream csv(csv_dir + "/tpch_operator_timing.csv", std::ios::out | std::ios::trunc);
 	csv << "query,join_label,baseline_ms,perfect_ms,bitmap_ms,bitmap_join_status,bitmap_payload_mode\n";

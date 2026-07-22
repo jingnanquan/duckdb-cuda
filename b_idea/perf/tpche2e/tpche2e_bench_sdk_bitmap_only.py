@@ -14,7 +14,7 @@ tpche2e_bench_sdk_bitmap_only.py — 只测 bitmap (SDK harness), official 用�
   - tpche2e_chart.png / tpche2e_speedup.png
 
 用法:
-  cd /data/workspace/database/duckdb-cuda
+  cd /home/featurize/workspace/duckdb-cuda
   bash b_idea/perf/tpche2e/build_harness.sh          # 先编译 harness
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk_bitmap_only.py
   python3 b_idea/perf/tpche2e/tpche2e_bench_sdk_bitmap_only.py --runs 5
@@ -32,7 +32,7 @@ import sys
 # ============================================================
 # 路径配置
 # ============================================================
-BASE_DIR = "/data/workspace/database/duckdb-cuda"
+BASE_DIR = "/home/featurize/workspace/duckdb-cuda"
 DATA_DIR = os.path.join(BASE_DIR, "data", "tpch_sf5_bitmap")
 META_PATH = os.path.join(DATA_DIR, "bitmap_join_meta.json")
 PROJECT_LIB = os.path.join(BASE_DIR, "build", "release", "src", "libduckdb.so")
