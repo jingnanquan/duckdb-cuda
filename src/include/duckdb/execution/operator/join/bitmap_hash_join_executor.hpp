@@ -62,6 +62,11 @@ struct BitmapJoinLocalState {
 	//! 依赖 BHJ 的前提: build 侧是 PK(唯一)侧, 同一 rowid 不会被置位两次, 故
 	//! sum(valid_count) == bitmap_size <=> popcount(global_bitmap) == bitmap_size。
 	idx_t valid_count = 0;
+
+	//! 稠密模式 VARCHAR payload: 每个 build 线程的本地 StringHeap 向量 (每 VARCHAR 列一个)。
+	//! 字符串字节深拷贝进各自的本地堆, 再写全局 payload_columns 的 string_t (指向本地堆),
+	//! 从而多线程写各自堆 → 无锁; build 结束后在 CombineBitmapDense 移入 executor 全局保活。
+	vector<unique_ptr<Vector>> varchar_payload_heaps;
 };
 
 //! Global Bitmap-Join executor, owned by HashJoinGlobalSinkState. Holds the merged
@@ -139,11 +144,19 @@ private:
 	idx_t compact_payload_count = 0;
 
 	//! 条目8: payload 列按物理类型分流。定长列 scatter 写不同 rowid 位置，lock-free 安全；
-	//! 变长列(VARCHAR) scatter 需操作 StringHeap，必须加锁。分流后定长列不被 varchar 锁阻塞。
+	//! VARCHAR 走每线程本地 StringHeap 无锁写入 (消除全局锁串行化); 其它变长(ARRAY/LIST/STRUCT)
+	//! 仍走全局加锁深拷贝 (非 Q14 瓶颈)。
 	vector<idx_t> fixed_payload_indices;
-	vector<idx_t> var_payload_indices;
-	//! One lock per variable-width payload column to avoid serializing independent StringHeaps.
-	vector<unique_ptr<mutex>> var_payload_locks;
+	//! VARCHAR payload 列: 走每线程本地 StringHeap 无锁写入。
+	vector<idx_t> varchar_payload_indices;
+	//! 其它变长 payload 列 (ARRAY/LIST/STRUCT 等): 仍走全局加锁深拷贝。
+	vector<idx_t> other_var_payload_indices;
+	//! One lock per "other" variable-width payload column to avoid serializing independent StringHeaps.
+	vector<unique_ptr<mutex>> var_payload_locks;  // 与 other_var_payload_indices 对齐
+	//! 各 build 线程本地 VARCHAR 堆的全局保活集合: CombineBitmapDense 时从 local state 移入。
+	//! 存放着 payload_columns 中 string_t 实际指向的字符串字节, 必须跟随整个 join 生命周期。
+	vector<unique_ptr<Vector>> var_payload_heap_keepers;
+	mutex var_payload_keep_lock;
 
 	bool ready = false;
 	//! 5.1 (perf/sf5/combine锁 / 根因分析-详细版.md §5.1): 稠密 fast-path 标志。

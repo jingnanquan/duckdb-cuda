@@ -169,11 +169,16 @@ BitmapJoinExecutor::BitmapJoinExecutor(const PhysicalHashJoin &join_p) : join(jo
 		}
 		payload_source_columns.push_back(source_col);
 
-		// 条目8: 分流定长/变长 payload 列。定长列的 scatter 写不同 rowid 位置，天然无数据竞争，
-		// 可以 lock-free；变长列(VARCHAR/ARRAY)的 scatter 需要操作有状态分配器，必须加锁。
+		// 条目8: 分流定长/变长 payload 列。
+		//   - 定长列: scatter 写不同 rowid, 天然无竞争, lock-free。
+		//   - VARCHAR: 走每线程本地 StringHeap 无锁写入 (见 SinkBitmapDense), 消除全局锁串行化。
+		//   - ARRAY/LIST/STRUCT 等其它变长: 仍走全局加锁深拷贝 (深拷贝需操作共享 StringHeap, 且非 Q14 瓶颈)。
 		auto internal = join.rhs_output_columns.col_types[i].InternalType();
-		if (internal == PhysicalType::VARCHAR || internal == PhysicalType::ARRAY) {
-			var_payload_indices.push_back(i);
+		if (internal == PhysicalType::VARCHAR) {
+			varchar_payload_indices.push_back(i);
+		} else if (internal == PhysicalType::ARRAY || internal == PhysicalType::LIST ||
+		           internal == PhysicalType::STRUCT) {
+			other_var_payload_indices.push_back(i);
 			var_payload_locks.push_back(make_uniq<mutex>());
 		} else {
 			fixed_payload_indices.push_back(i);
@@ -477,12 +482,50 @@ void BitmapJoinExecutor::SinkBitmapDense(DataChunk &chunk, DataChunk &build_keys
 		auto &source = chunk.data[payload_source_columns[c]];
 		ScatterColumn(source, valid_rows, rowids.data(), valid_count, count, *payload_columns[c]);
 	}
-	for (idx_t var_pos = 0; var_pos < var_payload_indices.size(); var_pos++) {
-		const idx_t c = var_payload_indices[var_pos];
+
+	// 3) VARCHAR payload 列: 每线程把字符串深拷贝进本线程的本地 StringHeap 向量, 再无锁把 string_t
+	//    写到全局 payload_columns[c] 的对应 rowid 槽位。不同线程写不同 rowid (data 缓冲非重叠) 且只
+	//    碰自己的本地堆 → 完全无锁, 消除了 Q14 上 var_payload_locks 把整列深拷贝串行化的瓶颈。
+	//    关键: 这里是"深拷贝到本地堆"而非浅引用 source —— source 是临时 build chunk, 其堆生命周期
+	//    不归 join 所有; 本地堆在 CombineBitmapDense 时被移入 executor 的 var_payload_heap_keepers
+	//    全局保活, string_t 指向的字节在整个 join 期间都有效 (对齐 perfect 的 collection 模型)。
+	for (idx_t vpos = 0; vpos < varchar_payload_indices.size(); vpos++) {
+		const idx_t c = varchar_payload_indices[vpos];
+		auto &source = chunk.data[payload_source_columns[c]];
+		auto &target = *payload_columns[c];
+		UnifiedVectorFormat s;
+		source.ToUnifiedFormat(count, s);
+		// 取/建本线程的本地堆向量 (只有本线程访问, 无锁)。
+		if (lstate.varchar_payload_heaps.size() <= vpos) {
+			lstate.varchar_payload_heaps.resize(vpos + 1);
+		}
+		if (!lstate.varchar_payload_heaps[vpos]) {
+			lstate.varchar_payload_heaps[vpos] =
+			    make_uniq<Vector>(join.rhs_output_columns.col_types[c], STANDARD_VECTOR_SIZE);
+		}
+		auto &heap_vec = *lstate.varchar_payload_heaps[vpos];
+		auto sdata = s.GetData<string_t>();
+		auto tdata = FlatVector::GetData<string_t>(target);
+		auto &tmask = FlatVector::Validity(target);
+		for (idx_t k = 0; k < valid_count; k++) {
+			const idx_t i = valid_rows.get_index(k);
+			const idx_t sidx = s.sel->get_index(i);
+			const idx_t rowid = rowids[k];
+			if (!s.validity.RowIsValid(sidx)) {
+				tmask.SetInvalid(rowid);  // 与 ScatterFixed 同款: 非原子 RMW, 仅 NULL 行触发, Q14 不命中
+				continue;
+			}
+			tdata[rowid] = StringVector::AddStringOrBlob(heap_vec, sdata[sidx]);
+		}
+	}
+
+	//    其它变长 (ARRAY/LIST/STRUCT): 仍走全局加锁逐行深拷贝 (深拷贝需操作共享 StringHeap)。
+	for (idx_t vpos = 0; vpos < other_var_payload_indices.size(); vpos++) {
+		const idx_t c = other_var_payload_indices[vpos];
 		auto &source = chunk.data[payload_source_columns[c]];
 		UnifiedVectorFormat s;
 		source.ToUnifiedFormat(count, s);
-		lock_guard<mutex> guard(*var_payload_locks[var_pos]);
+		lock_guard<mutex> guard(*var_payload_locks[vpos]);
 		ScatterColumnUnified(source, s, valid_rows, rowids.data(), valid_count, *payload_columns[c]);
 	}
 }
@@ -563,6 +606,17 @@ void BitmapJoinExecutor::CombineBitmapDense(BitmapJoinLocalState &lstate) {
 	// perf/sf5/combine锁 优化 (§建议2): 汇总本线程累计的有效 build 行数到全局计数，
 	// 供 FinalizeBitmap 以 O(1) 读取替代 O(bitmap_size/64) 的 CountValid 全量扫描。
 	total_valid_count.fetch_add(lstate.valid_count, std::memory_order_relaxed);
+
+	// 把本线程的本地 VARCHAR 堆移入 executor 全局保活集合, 使 payload_columns 中 string_t 指向的
+	// 字节在整个 join 期间有效。这些堆只归本线程所有, 此处独占访问 (安全); 移入共享 keeper 列表时
+	// 用 var_payload_keep_lock 保护 (每线程一次性, 不在 build 热路径上)。
+	if (!lstate.varchar_payload_heaps.empty()) {
+		lock_guard<mutex> guard(var_payload_keep_lock);
+		for (auto &heap : lstate.varchar_payload_heaps) {
+			var_payload_heap_keepers.push_back(std::move(heap));
+		}
+		lstate.varchar_payload_heaps.clear();
+	}
 }
 
 void BitmapJoinExecutor::CombineBitmapCompact(BitmapJoinLocalState &lstate) {
