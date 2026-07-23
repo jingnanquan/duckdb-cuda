@@ -148,8 +148,12 @@ cd /home/featurize/workspace/duckdb-cuda
 ./build/release/test/unittest "[bitmap_join_tpch]"
 BHJ_QUERIES=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22 ./build/release/test/unittest "[bitmap_join_tpch]"
 
+BHJ_QUERIES=1 ./build/release/test/unittest "[bitmap_join_tpch]"
+
+
 # 算子级(HASH_JOIN)耗时画像(baseline/perfect/bitmap三模式对比) + 22条标准TPCH SQL全量smoke test
 ./build/release/test/unittest "[bitmap_join_tpch_profile]"
+BHJ_QUERIES=1 ./build/release/test/unittest "[bitmap_join_tpch_profile]"
 
 # 单条等值连接场景下的 BHJ vs PerfectHashJoin vs 普通HashJoin 性能对比
 ./build/release/test/unittest "[bitmap_join][.]"
